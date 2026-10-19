@@ -6,7 +6,7 @@ import html
 import json
 from pathlib import Path
 
-from policypulse.config import DISCLAIMER
+from policypulse.config import DISCLAIMER, MAPPING_CAVEAT, REPO_ROOT
 from policypulse.pipeline import RunResult
 
 
@@ -14,8 +14,17 @@ def _esc(text) -> str:
     return html.escape(str(text or ""))
 
 
+def relative_snapshot(path: str) -> str:
+    """Markdown 里写相对仓库根的路径；JSON/DB 仍保留绝对路径。"""
+    try:
+        return Path(path).resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except (ValueError, OSError):
+        return path
+
+
 def render_markdown(result: RunResult) -> str:
     s = result.stats
+    min_strength = s.get("min_strength_for_report", 3)
     lines: list[str] = []
     lines.append(f"# PolicyPulse 日报 {result.window_end}")
     lines.append("")
@@ -31,25 +40,44 @@ def render_markdown(result: RunResult) -> str:
     lines.append(f"| 抽取信号 | {s['signals']} |")
     lines.append(f"| 有映射个股的信号 | {s['with_tickers']} |")
     lines.append(f"| 个股结论行数 | {s['ticker_rows']} |")
-    lines.append(f"| 信息源（成功/总数） | {s['sources_total'] - s['sources_failed']} / {s['sources_total']} |")
+    lines.append(f"| 信息源（成功/总数） | {s.get('sources_ok', s['sources_total'] - s['sources_failed'])}"
+                 f" / {s['sources_total']} |")
+    lines.append(f"| 抓取失败条目 | {s.get('fetch_failures', 0)} |")
+    lines.append(f"| 跨 run 去重跳过 | {s.get('duplicates_skipped', 0)} |")
     lines.append(f"| LLM 抽取 | {'开启' if s['llm_enabled'] else '关闭（规则抽取）'} |")
     lines.append(f"| tongstock 调用（不含缓存命中） | {s['tongstock_calls']} |")
     lines.append("")
+    lines.append(f"> 口径说明：{MAPPING_CAVEAT}")
+    lines.append("")
 
-    if s["sources_failed"]:
+    warned: list[str] = list(result.failed_sources) + list(result.warnings)
+    if warned:
         lines.append("### 抓取告警")
         lines.append("")
-        for item in result.failed_sources[:10]:
+        for item in warned[:15]:
             lines.append(f"- {item}")
         lines.append("")
 
-    bullish = [c for c in result.conclusions if c["direction"] == "利好" and c["tickers"]]
+    if result.duplicates_skipped:
+        lines.append(f"- 另有 {result.duplicates_skipped} 篇文档正文指纹已在库（跨 run 去重），本次未重复抽取。")
+        lines.append("")
+    if s.get("out_of_window_docs"):
+        lines.append(f"- 有 {s['out_of_window_docs']} 篇来自「栏目窗口内无更新」的兜底抓取，日期可能早于统计窗口，"
+                     "对应条目在下方标注 `窗口外兜底`。")
+        lines.append("")
+
+    bullish_all = [c for c in result.conclusions if c["direction"] == "利好" and c["tickers"]]
+    bullish = [c for c in bullish_all if c["strength"] >= min_strength]
+    filtered_out = len(bullish_all) - len(bullish)
     bullish.sort(key=lambda c: (-c["strength"], -c["confidence"]))
 
     lines.append("## 利好信号与候选个股")
     lines.append("")
+    if filtered_out:
+        lines.append(f"另有 {filtered_out} 条利好结论力度 < {min_strength}，未列入本表，详见同名 JSON 与数据库。")
+        lines.append("")
     if not bullish:
-        lines.append("本轮没有命中「利好且有板块映射」的信号。")
+        lines.append(f"本轮没有命中「利好、有板块映射且力度 ≥ {min_strength}」的信号。")
         lines.append("")
 
     for idx, c in enumerate(bullish, start=1):
@@ -60,9 +88,10 @@ def render_markdown(result: RunResult) -> str:
         lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
         lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
         lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
-        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
+        fallback = " · `窗口外兜底`" if c.get("out_of_window_fallback") else ""
+        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}{fallback}")
         lines.append(f"- 原文：[{c['source_url']}]({c['source_url']})")
-        lines.append(f"- 快照：`{c['raw_snapshot_path']}`")
+        lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
         lines.append("")
         lines.append(f"> {c['quote']}")
         lines.append("")
@@ -79,9 +108,10 @@ def render_markdown(result: RunResult) -> str:
             lines.append("_未映射到板块（宁缺勿错），该信号仍保留溯源。_")
         lines.append("")
 
-    others = [c for c in result.conclusions if c not in bullish]
+    bullish_ids = {c["signal_id"] for c in bullish}
+    others = [c for c in result.conclusions if c["signal_id"] not in bullish_ids]
     if others:
-        lines.append("## 其余信号（中性/利空/无映射）")
+        lines.append("## 其余信号（中性/利空/力度不足/无映射）")
         lines.append("")
         lines.append("| 信号ID | 方向 | 力度 | 摘要 | 来源 |")
         lines.append("|---|---|---|---|---|")
@@ -92,7 +122,8 @@ def render_markdown(result: RunResult) -> str:
 
     lines.append("## 运行元信息")
     lines.append("")
-    lines.append(f"- 快照目录：`{Path(result.docs[0].snapshot_path).parent if result.docs else '—'}`")
+    snap_dir = Path(result.docs[0].snapshot_path).parent if result.docs else None
+    lines.append(f"- 快照目录：`{relative_snapshot(str(snap_dir)) if snap_dir else '—'}`")
     lines.append(f"- 数据库：`data/policypulse.db`（run_id `{result.run_id}`）")
     lines.append(f"- 复核命令：`policypulse verify --run {result.run_id}`")
     lines.append(f"- 单信号溯源：`policypulse show {result.conclusions[0]['signal_id'] if result.conclusions else '<signal_id>'}`")
@@ -107,18 +138,22 @@ def render_json(result: RunResult) -> str:
         "window": {"start": result.window_start, "end": result.window_end},
         "stats": result.stats,
         "failed_sources": result.failed_sources,
+        "warnings": result.warnings,
         "conclusions": result.conclusions,
         "disclaimer": DISCLAIMER,
+        "mapping_caveat": MAPPING_CAVEAT,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def render_html(result: RunResult) -> str:
     s = result.stats
+    min_strength = s.get("min_strength_for_report", 3)
     rows: list[str] = []
     for c in result.conclusions:
-        if c["direction"] != "利好" or not c["tickers"]:
+        if c["direction"] != "利好" or not c["tickers"] or c["strength"] < min_strength:
             continue
+        fallback = " · 窗口外兜底" if c.get("out_of_window_fallback") else ""
         trows = "".join(
             f"<tr><td>{t['rank']}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
             f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
@@ -129,7 +164,7 @@ def render_html(result: RunResult) -> str:
         rows.append(
             f"<section><h3>{_esc(c['summary'])}</h3>"
             f"<p class='meta'>{_esc(c['org'])} · {_esc(c['meeting_type'])} · {_esc(c['published_at'])} · "
-            f"strength {c['strength']} · 置信度 {c['confidence']}</p>"
+            f"strength {c['strength']} · 置信度 {c['confidence']}{fallback}</p>"
             f"<blockquote>{_esc(c['quote'])}</blockquote>"
             f"<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
             f"<th>score</th><th>理由</th><th>溯源</th></tr></thead><tbody>{trows}</tbody></table></section>"
@@ -146,9 +181,11 @@ table{{border-collapse:collapse;width:100%;margin:8px 0 20px;font-size:14px}}
 th,td{{border:1px solid #e2e2e2;padding:6px 8px;text-align:left}}
 th{{background:#f5f5f5}}
 .disc{{background:#fff6f6;border:1px solid #f0c9c9;padding:10px 14px;color:#8a2b2b;font-size:13px}}
+.caveat{{background:#fbf8ef;border:1px solid #e6d69a;padding:10px 14px;color:#6b5716;font-size:13px}}
 </style></head><body>
 <h1>PolicyPulse 日报 {_esc(result.window_end)}</h1>
 <p class="disc">{_esc(DISCLAIMER)}</p>
+<p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
 <p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']}</p>
 {''.join(rows) or '<p>本轮没有命中「利好且有板块映射」的信号。</p>'}
 <p class="disc">{_esc(DISCLAIMER)}</p>

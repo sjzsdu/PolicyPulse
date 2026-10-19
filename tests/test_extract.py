@@ -46,12 +46,15 @@ def test_theme_and_direction():
 
 
 def test_strength_rises_with_funding_cues():
-    weak = "要继续做好相关工作，稳步推进改革。"
-    strong = "设立专项资金支持人工智能算力中心建设，安排资金200亿元。"
+    weak = "会议要求继续做好相关工作，稳步推进各项改革任务落实，确保政策落地见效。"
+    strong = ("会议决定设立专项资金支持人工智能算力中心建设，"
+              "今年安排资金200亿元，落实技术改造投资相关税收优惠政策。")
     s_weak = extract_signals("d1", "会议", weak, load_theme_alias(), Settings())
     s_strong = extract_signals("d2", "会议", strong, load_theme_alias(), Settings())
-    if s_weak and s_strong:
-        assert max(s.strength for s in s_strong) >= max(s.strength for s in s_weak)
+    assert s_strong, "带专项资金与金额的部署句必须抽出信号"
+    assert max(s.strength for s in s_strong) >= 4
+    if s_weak:
+        assert max(s.strength for s in s_strong) > max(s.strength for s in s_weak)
 
 
 def test_low_value_sentences_are_dropped():

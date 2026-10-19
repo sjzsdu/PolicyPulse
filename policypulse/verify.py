@@ -7,14 +7,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from policypulse.http import FetchError, Fetcher, content_hash
+from policypulse.http import FetchError, Fetcher, RobotsDisallowed, content_hash
 from policypulse.text import html_to_text
+
+
+def _classify(exc: FetchError) -> str:
+    """429/503 是被限速；4xx 才是链接本身失效。"""
+    msg = str(exc)
+    if "HTTP 429" in msg or "HTTP 503" in msg:
+        return STATUS_RATE_LIMITED
+    if "HTTP 4" in msg:
+        return STATUS_GONE
+    return STATUS_ERROR
 from policypulse.store import Store
 
 STATUS_OK = "一致"
 STATUS_CHANGED = "内容已变"
 STATUS_GONE = "链接失效"
+STATUS_RATE_LIMITED = "被限速、暂不可验"
 STATUS_ERROR = "抓取失败"
+ALL_STATUSES = (STATUS_OK, STATUS_CHANGED, STATUS_GONE, STATUS_RATE_LIMITED, STATUS_ERROR)
 
 
 @dataclass
@@ -50,8 +62,14 @@ def verify_documents(store: Store, doc_ids: list[str] | None = None, run_id: str
                 html = fetcher.get_text(url)
                 new_hash = content_hash(html_to_text(html))
                 status = STATUS_OK if new_hash == old_hash else STATUS_CHANGED
+            except RobotsDisallowed:
+                results.append(VerifyResult(row["doc_id"], url, STATUS_RATE_LIMITED,
+                                            old_hash, ""))
+                store.log_verify(row["doc_id"], url, STATUS_RATE_LIMITED, old_hash, "")
+                continue
             except FetchError as exc:
-                status = STATUS_GONE if "HTTP 40" in str(exc) or "HTTP 4" in str(exc) else STATUS_ERROR
+                # G：429 是被限速，不是链接失效，不能混为一谈
+                status = _classify(exc)
                 new_hash = ""
             results.append(VerifyResult(row["doc_id"], url, status, old_hash, new_hash))
             store.log_verify(row["doc_id"], url, status, old_hash, new_hash)
@@ -66,7 +84,7 @@ def render_verify(results: list[VerifyResult]) -> str:
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
     lines = ["| 状态 | 数量 |", "|---|---|"]
-    for status in (STATUS_OK, STATUS_CHANGED, STATUS_GONE, STATUS_ERROR):
+    for status in ALL_STATUSES:
         lines.append(f"| {status} | {counts.get(status, 0)} |")
     lines.append("")
     lines.append("| doc_id | 状态 | URL |")

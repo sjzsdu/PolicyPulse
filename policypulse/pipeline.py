@@ -43,6 +43,8 @@ class DocRecord:
     snapshot_path: str
     body: str
     duplicate_of: str = ""
+    # H：窗口内该栏目无更新时，退回去抓入口页最近几条，产物里要能看到
+    out_of_window_fallback: bool = False
 
 
 @dataclass
@@ -54,6 +56,8 @@ class RunResult:
     signals: list = field(default_factory=list)
     conclusions: list[dict] = field(default_factory=list)
     failed_sources: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    duplicates_skipped: int = 0
     stats: dict = field(default_factory=dict)
 
 
@@ -68,14 +72,18 @@ def _in_window(published: str, start: str, end: str) -> bool:
 
 
 def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: str,
-                    window_end: str, snapshot_dir: Path, run_id: str) -> tuple[list[DocRecord], list[str]]:
+                    window_end: str, snapshot_dir: Path, run_id: str,
+                    store: Store | None = None) -> tuple[list[DocRecord], list[str], int]:
     docs: list[DocRecord] = []
     failed: list[str] = []
     seen_hashes: dict[str, str] = {}
+    duplicates_skipped = 0
 
     for spec in specs:
         if not spec.enabled:
             continue
+        # E：源的 rate_limit_seconds 真接上，不再硬编码
+        fetcher.configure_rate_limit(spec.url, spec.rate_limit_seconds)
         try:
             adapter = get_adapter(spec)
             items = adapter.discover(spec, fetcher)
@@ -85,14 +93,19 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
 
         picked = []
         for item in items:
+            fetcher.configure_rate_limit(item.url, spec.rate_limit_seconds)
             if item.published_at and not _in_window(item.published_at, window_start, window_end):
                 continue
             picked.append(item)
             if len(picked) >= settings.max_docs_per_source:
                 break
+        fallback_used = False
         if not picked and items:
             # 该栏目在窗口内没有更新：抓入口页最近几条，保证链路有真实素材
             picked = items[: min(3, settings.max_docs_per_source)]
+            fallback_used = True
+            for item in picked:
+                fetcher.configure_rate_limit(item.url, spec.rate_limit_seconds)
 
         for item in picked:
             try:
@@ -115,6 +128,13 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                 continue
             seen_hashes[digest] = item.url
 
+            # F：跨 run 去重——正文指纹已入库就不再重复抽
+            if settings.cross_run_dedupe and store is not None:
+                known = store.document_exists_hash(digest)
+                if known:
+                    duplicates_skipped += 1
+                    continue
+
             doc_id = doc_id_for(item.url)
             snap = snapshot_dir / f"{doc_id}.html"
             snap.write_text(html, encoding="utf-8")
@@ -133,8 +153,9 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                 raw_hash=raw_digest,
                 snapshot_path=str(snap),
                 body=body,
+                out_of_window_fallback=fallback_used,
             ))
-    return docs, failed
+    return docs, failed, duplicates_skipped
 
 
 def build_conclusions(docs, store: Store, settings: Settings, client: TongstockClient,
@@ -222,6 +243,7 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
                 "model": sig.model,
                 "prompt_version": sig.prompt_version,
                 "matched_sectors": [m.sector_name for m in matches],
+                "out_of_window_fallback": doc.out_of_window_fallback,
                 "tickers": tickers,
             })
     return all_signals, conclusions
@@ -268,15 +290,17 @@ def _signals_from_llm(doc, store: Store, settings: Settings):
 
 def run(settings: Settings, paths, target_date: date | None = None,
         sources_file: Path | None = None, refresh_market: bool = False,
-        only_sources: list[str] | None = None) -> RunResult:
+        only_sources: list[str] | None = None, fetcher: Fetcher | None = None,
+        market_client=None) -> RunResult:
     target = target_date or date.today()
     window_start = (target - timedelta(days=settings.lookback_days - 1)).isoformat()
     window_end = target.isoformat()
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
-    specs = load_sources(sources_file) if sources_file else load_sources()
+    all_specs = load_sources(sources_file) if sources_file else load_sources()
     if only_sources:
-        specs = [s for s in specs if s.id in only_sources]
+        all_specs = [s for s in all_specs if s.id in only_sources]
+    specs = [s for s in all_specs if s.enabled]  # 关闭的源不计入成功率分母
 
     store = Store(paths.db)
     store.start_run(run_id, window_start, window_end, SCORE_VERSION)
@@ -287,12 +311,23 @@ def run(settings: Settings, paths, target_date: date | None = None,
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     alias_map = load_theme_alias()
-    with Fetcher(timeout=settings.request_timeout, retries=settings.request_retries,
-                 user_agent=settings.user_agent, min_interval=2.0, verify_tls=True) as fetcher:
-        docs, failed = fetch_documents(fetcher, specs, settings, window_start, window_end,
-                                       snapshot_dir, run_id)
+    warnings: list[str] = []
+    owns_fetcher = fetcher is None
+    if owns_fetcher:
+        # E：不再硬编码 2.0，默认间隔只作兜底，真实间隔由 sources.yaml 逐源下发
+        fetcher = Fetcher(timeout=settings.request_timeout, retries=settings.request_retries,
+                          user_agent=settings.user_agent, min_interval=2.0, verify_tls=True,
+                          robots_unavailable_interval=settings.robots_unavailable_interval)
+    try:
+        docs, failed, duplicates = fetch_documents(
+            fetcher, specs, settings, window_start, window_end, snapshot_dir, run_id, store)
+        warnings.extend(getattr(fetcher, "warnings", []))
+    finally:
+        if owns_fetcher:
+            fetcher.close()
 
-    client = TongstockClient(settings, cache_dir=paths.cache, refresh=refresh_market)
+    client = market_client or TongstockClient(settings, cache_dir=paths.cache,
+                                              refresh=refresh_market)
     try:
         signals, conclusions = build_conclusions(docs, store, settings, client, run_id, alias_map)
     except TongstockError as exc:
@@ -305,14 +340,22 @@ def run(settings: Settings, paths, target_date: date | None = None,
 
     result = RunResult(run_id=run_id, window_start=window_start, window_end=window_end,
                        docs=docs, signals=signals, conclusions=conclusions,
-                       failed_sources=failed)
+                       failed_sources=failed, warnings=warnings,
+                       duplicates_skipped=duplicates)
+    ok_sources = {d.source_id for d in docs}
     result.stats = {
         "docs": len(docs),
         "signals": len(signals),
         "with_tickers": sum(1 for c in conclusions if c["tickers"]),
         "ticker_rows": ticker_count,
         "sources_total": len(specs),
-        "sources_failed": len(failed),
+        # 一个源只要抓到 1 篇就算成功；单篇失败只计条目，不算源挂掉
+        "sources_ok": len(ok_sources),
+        "sources_failed": len(specs) - len(ok_sources),
+        "fetch_failures": len(failed),
+        "duplicates_skipped": duplicates,
+        "out_of_window_docs": sum(1 for d in docs if d.out_of_window_fallback),
+        "min_strength_for_report": settings.min_strength_for_report,
         "tongstock_calls": client.calls,
         "llm_enabled": llm.llm_available(),
         "disclaimer": DISCLAIMER,

@@ -37,9 +37,15 @@ def test_exact_and_alias_match():
     assert matches[0].confidence == 1.0
 
 
-def test_fuzzy_match_is_confident_or_absent():
-    matches = match_sectors(["人工智能"], CONCEPTS, INDUSTRIES)
-    assert matches == [] or matches[0].confidence <= 0.9
+def test_fuzzy_match_only_when_similar_enough():
+    """近义主题要么不映射，要么以 ≤0.9 的置信度映射；绝不能冒充精确命中。"""
+    similar = match_sectors(["算力"], ["算力租赁"], INDUSTRIES)
+    assert similar, "算力 与 算力租赁 是别名/包含关系，应能映射"
+    assert similar[0].match_type in ("alias", "contains", "fuzzy")
+    assert similar[0].confidence <= 0.9, "非精确命中不能给 1.0"
+
+    unrelated = match_sectors(["量子科技"], ["低空经济", "算力租赁"], INDUSTRIES)
+    assert unrelated == [], "完全不相干的板块不应被模糊命中"
 
 
 def test_unmatched_theme_is_dropped():
