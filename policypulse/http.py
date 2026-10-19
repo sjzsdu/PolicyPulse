@@ -57,6 +57,8 @@ class RobotsPolicy:
     status: str  # allowed / unavailable / error
     parser: RobotFileParser | None = None
     reason: str = ""
+    # 站点自己声明的抓取间隔（Crawl-delay）；我们按它来，不讨价还价
+    crawl_delay: float = 0.0
 
     def allows(self, url: str) -> bool:
         if self.status == "allowed":
@@ -86,6 +88,14 @@ class RobotsCache:
                                        headers={"User-Agent": self.user_agent})
         return self.client
 
+    def observed(self) -> dict[str, RobotsPolicy]:
+        """本轮**已经发生过**的判定快照。只为出合规台账用，不触发新请求。"""
+        return dict(self._cache)
+
+    def policy_for_host(self, host: str) -> RobotsPolicy | None:
+        """已判定过的 host 才返回；没判定过返回 None（不代为发起请求）。"""
+        return self._cache.get(host)
+
     def policy(self, url: str) -> RobotsPolicy:
         host = urlparse(url).netloc
         if host in self._cache:
@@ -94,6 +104,25 @@ class RobotsCache:
         self._cache[host] = policy
         return policy
 
+    @staticmethod
+    def _crawl_delay_of(body: str, user_agent: str) -> float:
+        """取适用于本 UA 的 Crawl-delay。没有声明就是 0（由调用方决定兜底间隔）。"""
+        delay = 0.0
+        applies = False
+        for raw in body.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.lower().startswith("user-agent:"):
+                applies = line.split(":", 1)[1].strip() in ("*", user_agent)
+                continue
+            if applies and line.lower().startswith("crawl-delay:"):
+                try:
+                    delay = max(delay, float(line.split(":", 1)[1].strip()))
+                except ValueError:
+                    pass
+        return delay
+
     def _parse_or_unavailable(self, body: str | None, host: str, reason: str = "") -> RobotsPolicy:
         """把 robots 文本解析成策略；拿不到就落成 unavailable 并记下原因。"""
         if not body:
@@ -101,7 +130,8 @@ class RobotsCache:
         parser = RobotFileParser()
         parser.set_url(f"https://{host}/robots.txt")
         parser.parse(body.splitlines())
-        return RobotsPolicy(host, "allowed", parser, "robots.txt 已获取")
+        return RobotsPolicy(host, "allowed", parser, "robots.txt 已获取",
+                            self._crawl_delay_of(body, self.user_agent))
 
     def _fetch(self, url: str, host: str) -> RobotsPolicy:
         parts = urlparse(url)
@@ -168,11 +198,20 @@ class Fetcher:
         self._host_interval[urlparse(url).netloc] = float(seconds)
 
     def interval_for(self, url: str) -> float:
-        return self._host_interval.get(urlparse(url).netloc, self.min_interval)
+        host = urlparse(url).netloc
+        base = self._host_interval.get(host, self.min_interval)
+        # 站点声明的 Crawl-delay 优先于我们自己设的更小间隔
+        policy = self.robots.policy_for_host(host)
+        if policy and policy.crawl_delay:
+            base = max(base, policy.crawl_delay)
+        return base
 
     def _throttle(self, url: str) -> None:
         host = urlparse(url).netloc
         interval = self._host_interval.get(host, self.min_interval)
+        policy = self.robots.policy_for_host(host)
+        if policy and policy.crawl_delay:
+            interval = max(interval, policy.crawl_delay)
         last = self._last_request_at.get(host)
         if last is not None:
             wait = interval - (time.monotonic() - last)

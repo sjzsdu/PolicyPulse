@@ -19,7 +19,7 @@ from policypulse.config import default_paths, load_settings, load_sources
 from policypulse.pipeline import run as run_pipeline
 from policypulse.report import write_reports
 from policypulse.store import Store
-from policypulse.verify import render_verify, verify_documents
+from policypulse.verify import OK_STATUSES, render_verify, verify_documents
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,7 +119,7 @@ def cmd_verify(args) -> int:
     store = Store(paths.db)
     results = verify_documents(store, doc_ids=args.doc or None, run_id=args.run_id)
     print(render_verify(results))
-    changed = sum(1 for r in results if r.status != "一致")
+    changed = sum(1 for r in results if r.status not in OK_STATUSES)
     store.close()
     return 0 if changed == 0 else 2
 

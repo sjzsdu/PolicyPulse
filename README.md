@@ -32,9 +32,11 @@ policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出�
 
 - `reports/YYYY-MM-DD.md` — 日报（主交付，快照路径写成**相对仓库根**，入库）
 - `reports/YYYY-MM-DD.html` — 单页只读展示（入库）
-- `reports/YYYY-MM-DD.json` — 同一批结论的结构化版本（**不入库**，含本机绝对路径）
+- `reports/YYYY-MM-DD.json` — 同一批结论的结构化版本（**不入库**，含本机绝对路径
+  与逐源合规台账 `stats.sources_detail`）
 - `data/policypulse.db` — SQLite：documents / signals / signal_ticker / runs …
-- `data/snapshots/<run_id>/*.html` — 原文快照（不入库）
+- `data/snapshots/<run_id>/*` — 原文快照（不入库，后缀跟随原件）
+- `inbound/<source_id>/` — 人工下载的原文（目录骨架入库，用户放进去的文件不入库）
 
 `reports/2026-10-19.md` 是本机真实跑出来的一份，可以直接打开看效果。
 
@@ -45,7 +47,7 @@ policypulse sources                    # 列出信息源清单
 policypulse show <signal_id>           # 打印一个信号的完整溯源链
 policypulse verify --run <run_id>      # 重抓原文核对：一致 / 内容已变 / 链接失效
 policypulse run --date 2026-10-09 --lookback-days 7
-policypulse run --sources gov_zhengce ndrc_xwfb
+policypulse run --sources gov_zhengce xinhua_pbc pbc_inbound
 ```
 
 ## 依赖的外部工具
@@ -63,11 +65,82 @@ tongstock block show 低空经济 -f block_gn.dat
 结果会缓存到 `data/cache/`，默认 24 小时内不重复打 TDX；`--refresh-market` 强制刷新。
 `block show` 返回的股票名不可信（会显示成指数名），代码里一律用 `stockinfo` / `codes list` 的名称订正。
 
+## 央行（pbc.gov.cn）怎么拿：robots 全站禁止下的换取法
+
+`http://www.pbc.gov.cn/robots.txt` 是：
+
+```
+User-agent: Baiduspider
+Allow: /
+User-agent: *
+Disallow: /
+```
+
+即**除了 Baiduspider，一律禁止抓取**。我们不会伪造 UA 去冒充 Baiduspider，也不会用
+代理池规避——`sources.yaml` 里的 `pbc_xw` 因此保持 `enabled: false`，`http.py` 的
+robots 四档判定会把任何针对该 host 的请求挡在前面。
+
+五个候选方向都实测过（不是估的），结论如下：
+
+| 方向 | 实测结果 | 结论 |
+|---|---|---|
+| 1. 转载源 · 新华网 `news.cn` | robots `User-Agent: * / Allow: /`；`fortune` 栏目日更，本轮命中 3 篇央行稿 | **采用**，`xinhua_pbc` |
+| 1. 转载源 · 中国政府网 `gov.cn` | robots `Allow: /1`（放行）；但 `zhengce/zuixin` 1105 条里央行相关仅 5 条、最新 2023-10；`xinwen/yaowen` 20253 条停在 2023-03 | 不新增源：已有两条 gov.cn 源，转载覆盖陈旧 |
+| 1. 转载源 · 人民网 `people.com.cn` | robots `Disallow:`（等于放行）但声明 `Crawl-delay: 120` | **不启用**：一轮 12 篇要 24 分钟。代码已按 `Crawl-delay` 限速，真要开就把 `enabled` 改 true 并接受耗时 |
+| 1. 转载源 · 金融时报 `financialnews.com.cn`（央行主管） | robots 404 → `unavailable` 档（可抓，保守 5s + 告警）；但 `yh/` 银行频道停在 2024-04 | 不接入：内容停更 |
+| 2. 央行官方公开接口/RSS | `pbc.gov.cn/rss.xml` 404；全站各栏目同 host，一律 `Disallow: /`；`sousuo.www.gov.cn`（政府网搜索接口）也是 `Disallow: /` | **不存在**合规的官方机器接口 |
+| 3. 申请抓取授权 | 央行站点未公布任何数据授权/爬虫白名单申请入口，也没有公开的成本与周期说明 | **无公开申请路径**，需要走线下公函，个人自用场景不可持续 |
+| 4. 人工/半自动 inbound | 用户本人浏览器下载属个人浏览行为，程序只解析本地文件 | **采用**，`pbc_inbound` |
+| 5. AkShare 等第三方数据接口 | 实测可安装可用（`akshare` 1.19.1，MIT）；`macro_china_lpr()` / `macro_china_money_supply()` 能取到数据 | **不接入**：返回的是**数值序列**，没有原文 URL、没有可校验的 quote，过不了「quote 必须是原文子串」和 `verify` 回溯；且引入 pandas 等重依赖，与单机零运维目标不符 |
+
+### 采用的两条路
+
+**① 转载（`xinhua_pbc`，默认启用）** — 新华网财经栏目，robots 实测 `allowed`，
+用 `title_pattern` 只收央行口径的稿子（中国人民银行/央行/货币政策/公开市场/降准/LPR/
+再贷款/逆回购/MLF…），不把整个财经频道搬进来。
+
+**② 人工入库（`pbc_inbound`，默认启用）** — 你自己下载央行原稿，放进目录即可：
+
+```bash
+# 1) 浏览器打开央行栏目，另存为（完整网页 或 只存文本都行）
+# 2) 放进这个目录，文件名带日期，并给一个溯源 URL
+inbound/pbc_inbound/2026-10-19-公开市场业务交易公告.html
+inbound/pbc_inbound/2026-10-19-公开市场业务交易公告.url   # 一行：原文 URL
+
+# 3) 照常跑
+policypulse run --sources pbc_inbound
+```
+
+溯源 URL 的三个来源（按优先级）：同名 `.url` 伴生文件 → 正文前 5 行的
+`原文: https://…` / `来源链接: …` 标记 → HTML 的 `<link rel="canonical">` / `<base href>`。
+**三者都没有的文件会被拒收并在告警区点名**——没有 URL 就没有 `source_url`，结论不可回溯，
+宁可不出结论。
+
+其它约定：
+
+- 文件**不删不移**，跨 run 去重靠正文指纹，重复跑同一批不会重复抽取。
+- `published_at` 优先取文件名里的 `YYYY-MM-DD`，其次正文里的日期；都取不到就留空
+  显示「日期未知」，**不拿文件 mtime 冒充发布日期**。
+- 目录空着不是故障，只在告警区提示；成功率统计不把本地源算进分母。
+- `policypulse verify` 对这类文档**不去重抓源站**（源站禁止抓取），改为与落盘的本地
+  原件复算指纹，状态显示「一致（本地原件）」。
+
+### 覆盖不到的部分（不拿劣质数据凑数）
+
+- 央行**政策文件原文**（如《货币政策执行报告》正文）只能靠上面第 ② 条人工入库；
+  没有原件就没有这条内容，不做转述、不做摘要替代。
+- 「利率市场化 / 公开市场操作」这类**不含产业主题词**的央行稿子，规则抽取能入库、
+  能 `verify`，但抽不出带板块映射的利好结论（没有主题词 → 映射不到通达信板块）。
+  它们出现在「央行相关文档」计数与「其余信号」表里，不会强行塞进个股排序表。
+- 央行**数值型数据**（M2、社融、LPR、公开市场操作量）目前完全不覆盖：现有链路只处理
+  「可回溯到原文的政策文本」，数值面板是另一条线，暂无计划。
+
 ## 它是怎么跑的
 
 ```
 sources.yaml 入口页
-  → 适配器做链接发现（gov_json_feed：栏目页渲染用的静态 JSON；html_list：列表页正则）
+  → 适配器做链接发现（gov_json_feed：栏目页渲染用的静态 JSON；html_list：列表页正则；
+    local_inbound：本地目录，不发网络请求）
   → 抓详情页，落原文快照 + 正文指纹去重
   → 规则抽取政策信号（无 LLM key 时默认路径；有 key 自动切 LLM，同一套校验兜底）
   → 主题归一（data/theme_alias.csv）→ 板块匹配（精确/别名/包含/模糊≥0.8）
@@ -141,6 +214,12 @@ export POLICYPULSE_LLM_MODEL=qwen-plus
 
 - 政府网栏目：找栏目页渲染用的静态 JSON，用 `gov_json_feed` + `feed_url`。
 - 普通列表页：用 `html_list` + `link_pattern`（+ 可选 `reject_pattern`）。
+- 转载源只想收某一类稿子：再加 `title_pattern`（对标题做正则过滤）。
+- 站点 robots 禁止抓取、但你自己能下载：用 `local_inbound` + `inbound_dir`，
+  见上一节「人工入库」。
+
+新增源必须在 `sources.yaml` 里写明该栏目路径与 **robots 实测判定**；日报的
+「信息源与合规」表会逐源列出判定结果与本轮文档数，停用源一律标注「不发起任何请求」。
 
 ## 测试
 
@@ -158,7 +237,12 @@ pytest -m tongstock             # 校验本机 tongstock 数据可用
 
 ## 已知边界（MVP 有意不做）
 
-- 源覆盖面：6 个（国务院×2 + 发改委/财政部/商务部/央行）。工信部站点列表页是
-  jpaas 动态渲染，暂未接入；扩源是后续增量。
+- 源覆盖面：联网源 6 个（国务院×2 + 发改委/财政部/商务部 + 新华网财经转载），
+  外加 1 个本地 inbound 源（人工下载的央行原稿）。工信部站点列表页是 jpaas 动态渲染，
+  暂未接入。
+- **央行**：pbc.gov.cn robots 全站禁止，直连源 `pbc_xw` 保持关闭；央行内容走
+  「新华网转载 + 人工入库」两条合规路径，详见上文专节。
+- 「利率市场化 / 公开市场操作」一类无产业主题词的央行稿子进得来、可 `verify`，
+  但映射不到板块，不会出现在个股排序表里。
 - 概念板块映射天然偏大市值（板块内按市值取 Top-N），个股层面不做基本面判断。
 - 打分是可解释的规则加权，不做价格预测、不给目标价、不接交易。

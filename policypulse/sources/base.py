@@ -15,6 +15,8 @@ class DiscoveredItem:
     url: str
     title: str
     published_at: str = ""  # YYYY-MM-DD，可为空
+    # 原文快照的落盘后缀：本地 inbound 源放的是 md/txt，不该硬写成 .html
+    snapshot_ext: str = ".html"
 
 
 class SourceAdapter(Protocol):

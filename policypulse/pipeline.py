@@ -9,9 +9,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from policypulse import llm
-from policypulse.config import DISCLAIMER, Settings, load_sources, load_theme_alias
+from policypulse.config import DISCLAIMER, REPO_ROOT, Settings, load_sources, load_theme_alias
 from policypulse.extract import classify_meeting_type, extract_signals, verify_quote
 from policypulse.http import FetchError, Fetcher, content_hash
 from policypulse.mapping import build_candidates, match_sectors
@@ -65,6 +66,57 @@ def doc_id_for(url: str) -> str:
     return "doc-" + content_hash(url)[:16]
 
 
+# 网站在 <title> 后面挂的自家站名，入库前去掉，免得标题里混进来源站点
+SITE_SUFFIX_RE = re.compile(
+    r"\s*[-—|]\s*(中国政府网|新华网|人民网|中国经济网|中国金融新闻网|金融时报)\s*$")
+
+# 转载源：从标题/机构名判断该文档是否与央行（中国人民银行）相关
+PBC_MENTION_RE = re.compile(
+    r"中国人民银行|央行|货币政策|公开市场业务|公开市场操作|存款准备金|降准|"
+    r"贷款市场报价利率|LPR|再贷款|再贴现|逆回购|中期借贷便利|MLF")
+
+
+def is_pbc_related(title: str, body: str) -> bool:
+    """文档是否与央行（中国人民银行）相关。用于产物里指认央行条目。"""
+    return bool(PBC_MENTION_RE.search(f"{title}\n{body[:1500]}"))
+
+
+def _source_compliance(specs, docs, fetcher) -> list[dict]:
+    """逐源的合规台账：启用状态 + robots 判定 + 本轮文档数。
+
+    停用或本地入库的源**不发起任何网络请求**，因此这里只读 robots 缓存里已经
+    发生过的判定，绝不为了填表去补一次请求（否则「没有直连 pbc.gov.cn」就不成立了）。
+    """
+    counts: dict[str, int] = {}
+    for doc in docs:
+        counts[doc.source_id] = counts.get(doc.source_id, 0) + 1
+    observed = fetcher.robots.observed() if getattr(fetcher, "robots", None) else {}
+
+    rows: list[dict] = []
+    for spec in specs:
+        host = urlparse(spec.url).netloc
+        if not spec.enabled:
+            status, reason = "未启用", "源已停用，本轮不发起任何请求"
+        elif spec.adapter == "local_inbound":
+            status, reason = "本地入库", "不发起网络请求：解析用户自己下载的本地文件"
+        else:
+            policy = observed.get(host)
+            if policy is None:
+                status, reason = "未判定", "本轮未对该 host 发起请求"
+            else:
+                status = policy.status
+                reason = policy.reason
+                if policy.crawl_delay:
+                    reason += f"（站点声明 Crawl-delay: {policy.crawl_delay:g}s）"
+        rows.append({
+            "id": spec.id, "org": spec.org, "tier": spec.tier, "host": host,
+            "adapter": spec.adapter, "column": spec.column,
+            "enabled": bool(spec.enabled), "robots": status, "robots_reason": reason,
+            "docs": counts.get(spec.id, 0),
+        })
+    return rows
+
+
 def _in_window(published: str, start: str, end: str) -> bool:
     if not published:
         return True  # 无日期的按 fetched 处理，交给调用方
@@ -76,6 +128,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                     store: Store | None = None) -> tuple[list[DocRecord], list[str], int]:
     docs: list[DocRecord] = []
     failed: list[str] = []
+    warnings: list[str] = []
     seen_hashes: dict[str, str] = {}
     duplicates_skipped = 0
 
@@ -90,6 +143,22 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
         except (FetchError, KeyError, ValueError) as exc:
             failed.append(f"{spec.id}: {type(exc).__name__}: {exc}")
             continue
+
+        # 本地 inbound：没有溯源 URL 的文件不入库，但不能静默跳过
+        missing = getattr(adapter, "missing_source_url", None)
+        if callable(missing):
+            for name in missing(spec):
+                warnings.append(f"{spec.id}: {name} 没有溯源 URL（加同名 .url 文件或在开头写"
+                                f"「原文: https://…」），已跳过")
+        if not items:
+            if spec.adapter == "local_inbound":
+                # 相对仓库根：日报是要入库给人看的，不能冒出本机绝对路径
+                warnings.append(f"{spec.id}: 本地 inbound 目录 {_rel_to_repo(adapter.directory(spec))} "
+                                f"为空，人工下载的央行原稿放进该目录即可入库（见 README「人工入库」）")
+            continue
+
+        # 正文最短长度：公开市场操作公告一类短稿可以逐源放宽
+        min_body = int(spec.extra.get("min_body_length", 200))
 
         picked = []
         for item in items:
@@ -109,15 +178,20 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
 
         for item in picked:
             try:
-                html = fetcher.get_text(item.url)
+                # 本地 inbound 源不经过网络：适配器自己提供正文
+                loader = getattr(adapter, "load", None)
+                html = loader(spec, fetcher, item) if loader else fetcher.get_text(item.url)
             except FetchError as exc:
                 failed.append(f"{spec.id}/{item.url}: {exc}")
                 continue
+            if not html:
+                failed.append(f"{spec.id}/{item.url}: 正文为空（本地文件可能已被移走）")
+                continue
 
             title = extract_title(html) or item.title
-            title = re.sub(r"\s*[-—|]\s*中国政府网\s*$", "", title).strip() or item.title
+            title = SITE_SUFFIX_RE.sub("", title).strip() or item.title
             body = extract_main_text(html)
-            if len(body) < 200:
+            if len(body) < min_body:
                 continue
             published = item.published_at or extract_publish_time(html, body)
 
@@ -136,7 +210,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                     continue
 
             doc_id = doc_id_for(item.url)
-            snap = snapshot_dir / f"{doc_id}.html"
+            snap = snapshot_dir / f"{doc_id}{item.snapshot_ext}"
             snap.write_text(html, encoding="utf-8")
 
             docs.append(DocRecord(
@@ -155,7 +229,25 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                 body=body,
                 out_of_window_fallback=fallback_used,
             ))
+    _emit_warnings(fetcher, warnings)
     return docs, failed, duplicates_skipped
+
+
+def _rel_to_repo(path) -> str:
+    try:
+        return Path(path).resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _emit_warnings(fetcher, messages: list[str]) -> None:
+    """把抓取期产生的告警挂到 fetcher.warnings，由 run() 统一进日报告警区。"""
+    if not messages:
+        return
+    sink = getattr(fetcher, "warnings", None)
+    if sink is None:
+        return
+    sink.extend(messages)
 
 
 def build_conclusions(docs, store: Store, settings: Settings, client: TongstockClient,
@@ -322,6 +414,7 @@ def run(settings: Settings, paths, target_date: date | None = None,
         docs, failed, duplicates = fetch_documents(
             fetcher, specs, settings, window_start, window_end, snapshot_dir, run_id, store)
         warnings.extend(getattr(fetcher, "warnings", []))
+        source_rows = _source_compliance(all_specs, docs, fetcher)
     finally:
         if owns_fetcher:
             fetcher.close()
@@ -343,18 +436,26 @@ def run(settings: Settings, paths, target_date: date | None = None,
                        failed_sources=failed, warnings=warnings,
                        duplicates_skipped=duplicates)
     ok_sources = {d.source_id for d in docs}
+    # 成功率只统计需要联网的源：本地 inbound 目录空着是常态，不该算源挂掉
+    net_source_ids = {s.id for s in specs if s.adapter != "local_inbound"}
+    ok_net = ok_sources & net_source_ids
     result.stats = {
         "docs": len(docs),
         "signals": len(signals),
         "with_tickers": sum(1 for c in conclusions if c["tickers"]),
         "ticker_rows": ticker_count,
-        "sources_total": len(specs),
+        "sources_total": len(net_source_ids),
         # 一个源只要抓到 1 篇就算成功；单篇失败只计条目，不算源挂掉
-        "sources_ok": len(ok_sources),
-        "sources_failed": len(specs) - len(ok_sources),
+        "sources_ok": len(ok_net),
+        "sources_failed": len(net_source_ids) - len(ok_net),
+        "local_inbound_sources": len(specs) - len(net_source_ids),
         "fetch_failures": len(failed),
         "duplicates_skipped": duplicates,
         "out_of_window_docs": sum(1 for d in docs if d.out_of_window_fallback),
+        # 央行相关内容条数与来源：WAN-10 的验收要能指认
+        "pbc_related_docs": sum(1 for d in docs if is_pbc_related(d.title, d.body)),
+        "pbc_related_sources": sorted({d.source_id for d in docs if is_pbc_related(d.title, d.body)}),
+        "sources_detail": source_rows,
         "min_strength_for_report": settings.min_strength_for_report,
         "tongstock_calls": client.calls,
         "llm_enabled": llm.llm_available(),

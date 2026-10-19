@@ -6,10 +6,13 @@ from policypulse.config import SourceSpec
 from policypulse.sources.base import SourceAdapter
 from policypulse.sources.gov_json import GovJsonFeedAdapter
 from policypulse.sources.html_list import HtmlListAdapter
+from policypulse.sources.local_inbound import LocalInboundAdapter
 
 _ADAPTERS: dict[str, SourceAdapter] = {
     "gov_json_feed": GovJsonFeedAdapter(),
     "html_list": HtmlListAdapter(),
+    # 不发网络请求：读本地 inbound 目录
+    "local_inbound": LocalInboundAdapter(),
 }
 
 
