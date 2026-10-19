@@ -4,6 +4,7 @@
 # adapter:
 #   gov_json_feed - 中国政府网栏目页渲染所用的静态 JSON 列表
 #   html_list     - 通用 HTML 列表页，按 link_pattern 做链接发现
+#   local_inbound - 本地 inbound 目录：解析用户自己下载的原文，不发起网络请求
 
 sources:
   - id: gov_zhengce
@@ -70,6 +71,45 @@ sources:
     link_pattern: '/art/\d{4}/art_'
     max_items: 30
     min_title_length: 10
+    enabled: true
+
+  # ---------- 央行（pbc.gov.cn robots 全站禁止）----------
+  #
+  # pbc.gov.cn/robots.txt = "User-agent: * / Disallow: /"（另有一条只放行 Baiduspider，
+  # 我们不是它，也不会伪造）。所以央行内容只能「换一种获取法」：
+  #   1) 新华网财经转载（robots: "User-Agent: * / Allow: /"，实测 allowed）；
+  #   2) 用户本人浏览器下载央行原稿 → 放本地 inbound 目录 → local_inbound 解析入库。
+  # 下面两个源都不向 pbc.gov.cn 发任何请求。
+
+  - id: xinhua_pbc
+    name: 财经·央行相关（转载）
+    org: 中国人民银行（新华网转载）
+    tier: 转载
+    adapter: html_list
+    url: http://www.news.cn/fortune/index.htm
+    column: 财经 > 央行相关通稿（转载）
+    meeting_type_hint: 新闻发布会
+    rate_limit_seconds: 2.0
+    link_pattern: '/fortune/\d{8}/[0-9a-f]{32}/c\.html$'
+    # 只要央行口径的稿子，别把整个财经频道都搬进来
+    title_pattern: '中国人民银行|央行|货币政策|公开市场|存款准备金|降准|贷款市场报价利率|LPR|再贷款|再贴现|逆回购|中期借贷便利|MLF'
+    max_items: 40
+    min_title_length: 8
+    enabled: true
+
+  - id: pbc_inbound
+    name: 人工下载原稿入库
+    org: 中国人民银行
+    tier: 部委
+    adapter: local_inbound
+    # 仅作溯源标识：local_inbound 不发起任何网络请求，不会抓这个 host
+    url: http://www.pbc.gov.cn/goutongjiaoliu/113456/113469/index.html
+    column: 新闻发布（人工下载 → 本地入库）
+    meeting_type_hint: 会议
+    rate_limit_seconds: 0
+    inbound_dir: inbound/pbc_inbound
+    # 公开市场业务交易公告一类的短稿只有百余字，放宽正文下限
+    min_body_length: 80
     enabled: true
 
   - id: pbc_xw

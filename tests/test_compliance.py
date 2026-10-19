@@ -106,6 +106,60 @@ def test_content_hash_is_stable():
     assert content_hash("甲 乙\n丙") == content_hash("甲乙丙")
 
 
+# ---------- 央行（pbc.gov.cn）的合规换取法 ----------
+
+def test_crawl_delay_declared_by_the_site_is_honored():
+    """站点自己声明 Crawl-delay 就得照办（人民网是 120s，故默认不启用）。"""
+    cache = RobotsCache()
+    cache._cache["people.com.cn"] = cache._parse_or_unavailable(
+        "User-agent: *\nDisallow: \nCrawl-delay: 120", "people.com.cn")
+    f = Fetcher(min_interval=1.0, check_robots=True)
+    f.robots = cache
+    try:
+        assert f.interval_for("http://people.com.cn/a.htm") == 120.0
+    finally:
+        f.close()
+
+
+class _ObservedOnly:
+    """只暴露已发生过的 robots 判定：台账不得为了填表去补一次请求。"""
+
+    def __init__(self, observed: dict) -> None:
+        self.robots = type("R", (), {"observed": lambda self: observed})()
+
+
+def test_source_compliance_ledger_marks_disabled_and_local_sources():
+    from policypulse.pipeline import _source_compliance
+
+    specs = [
+        SourceSpec(id="pbc_xw", name="新闻", org="中国人民银行", tier="部委",
+                   adapter="html_list", url="http://www.pbc.gov.cn/xw/", enabled=False),
+        SourceSpec(id="pbc_inbound", name="人工入库", org="中国人民银行", tier="部委",
+                   adapter="local_inbound", url="http://www.pbc.gov.cn/xw/", enabled=True),
+        SourceSpec(id="xinhua_pbc", name="财经·央行", org="中国人民银行（新华网转载）",
+                   tier="转载", adapter="html_list", url="http://www.news.cn/fortune/index.htm"),
+    ]
+    rows = _source_compliance(specs, [], _ObservedOnly({}))
+    by_id = {r["id"]: r for r in rows}
+
+    assert by_id["pbc_xw"]["robots"] == "未启用"
+    assert "不发起任何请求" in by_id["pbc_xw"]["robots_reason"]
+    assert by_id["pbc_inbound"]["robots"] == "本地入库"
+    assert "不发起网络请求" in by_id["pbc_inbound"]["robots_reason"]
+    # 没有判定过的 host 只能写「未判定」，绝不能为了出这张表去抓一次 robots
+    assert by_id["xinhua_pbc"]["robots"] == "未判定"
+
+
+def test_pbc_reprint_source_is_allowed_by_its_own_robots():
+    """新华社 news.cn 的 robots 是放行：转载这条路是实测可用的，不是猜的。"""
+    cache = RobotsCache()
+    cache._cache["www.news.cn"] = cache._parse_or_unavailable(
+        "# robots.txt for http://www.xinhuanet.com/\n\nUser-Agent: *\nAllow: /\n", "www.news.cn")
+    policy = cache.policy("http://www.news.cn/fortune/index.htm")
+    assert policy.status == "allowed"
+    assert policy.allows("http://www.news.cn/fortune/20261019/abc/c.html")
+
+
 # ---------- robots.txt：共用一套传输栈，且失败原因必须分开 ----------
 
 class _Resp:

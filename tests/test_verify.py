@@ -1,7 +1,18 @@
 import pytest
 
+from pathlib import Path
+
 from policypulse.http import Fetcher
-from policypulse.verify import STATUS_CHANGED, STATUS_GONE, STATUS_OK, render_verify, verify_documents
+from policypulse.verify import (
+    OK_STATUSES,
+    STATUS_CHANGED,
+    STATUS_GONE,
+    STATUS_LOCAL_MISSING,
+    STATUS_LOCAL_OK,
+    STATUS_OK,
+    render_verify,
+    verify_documents,
+)
 
 
 class _StubFetcher:
@@ -35,7 +46,13 @@ class _StubStore:
 
 
 def _doc(doc_id, url, hash_):
-    return {"doc_id": doc_id, "url": url, "content_hash": hash_, "raw_hash": hash_}
+    return {"doc_id": doc_id, "url": url, "content_hash": hash_, "raw_hash": hash_,
+            "source_id": None, "raw_snapshot_path": None}
+
+
+def _local_doc(doc_id, url, hash_, snapshot: Path):
+    return {"doc_id": doc_id, "url": url, "content_hash": hash_, "raw_hash": hash_,
+            "source_id": "pbc_inbound", "raw_snapshot_path": str(snapshot)}
 
 
 def test_verify_detects_identical_and_changed_content():
@@ -53,6 +70,34 @@ def test_verify_detects_identical_and_changed_content():
     assert status["d2"] == STATUS_CHANGED
     assert status["d3"] == STATUS_GONE
     assert len(store.logged) == 3
+
+
+def test_local_inbound_documents_are_verified_against_the_local_original(tmp_path):
+    """源站 robots 禁止抓取时，不能去重抓；与本地原件复算指纹，且不算「链接失效」。"""
+    original = tmp_path / "doc.html"
+    body = "<html><body><p>中国人民银行开展了公开市场业务逆回购操作。</p></body></html>"
+    original.write_text(body, encoding="utf-8")
+    from policypulse.http import content_hash
+    from policypulse.text import html_to_text
+
+    doc = _local_doc("d-inbound", "http://www.pbc.gov.cn/x/index.html",
+                     content_hash(html_to_text(body)), original)
+    store = _StubStore([doc])
+    # fetcher 若被调用就是 bug：本地源不该联网
+    results = verify_documents(store, doc_ids=["d-inbound"], fetcher=_StubFetcher({}),
+                               local_source_ids={"pbc_inbound"})
+    assert results[0].status == STATUS_LOCAL_OK
+    assert results[0].status in OK_STATUSES
+
+
+def test_local_inbound_missing_original_is_reported_not_guessed():
+    from policypulse.http import content_hash
+
+    doc = _local_doc("d-gone", "http://www.pbc.gov.cn/x/index.html",
+                     content_hash("原文"), __file__ + "/nope.html")
+    results = verify_documents(_StubStore([doc]), doc_ids=["d-gone"], fetcher=_StubFetcher({}),
+                               local_source_ids={"pbc_inbound"})
+    assert results[0].status == STATUS_LOCAL_MISSING
 
 
 def test_render_verify_table():

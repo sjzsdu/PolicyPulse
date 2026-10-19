@@ -100,3 +100,46 @@ def test_out_of_window_fallback_is_marked():
     md = render_markdown(r)
     assert "窗口外兜底" in md
     assert "来自「栏目窗口内无更新」的兜底抓取" in md
+
+
+def _with_compliance(result: RunResult) -> RunResult:
+    result.stats.update({
+        "pbc_related_docs": 2,
+        "pbc_related_sources": ["xinhua_pbc"],
+        "sources_detail": [
+            {"id": "xinhua_pbc", "org": "中国人民银行（新华网转载）", "tier": "转载",
+             "host": "www.news.cn", "adapter": "html_list", "column": "财经 > 央行相关",
+             "enabled": True, "robots": "allowed", "robots_reason": "robots.txt 已获取", "docs": 2},
+            {"id": "pbc_inbound", "org": "中国人民银行", "tier": "部委",
+             "host": "www.pbc.gov.cn", "adapter": "local_inbound", "column": "人工入库",
+             "enabled": True, "robots": "本地入库",
+             "robots_reason": "不发起网络请求：解析用户自己下载的本地文件", "docs": 0},
+            {"id": "pbc_xw", "org": "中国人民银行", "tier": "部委",
+             "host": "www.pbc.gov.cn", "adapter": "html_list", "column": "新闻发布",
+             "enabled": False, "robots": "未启用",
+             "robots_reason": "源已停用，本轮不发起任何请求", "docs": 0},
+        ],
+    })
+    return result
+
+
+def test_report_shows_pbc_coverage_and_its_source():
+    md = render_markdown(_with_compliance(_result()))
+    assert "央行（中国人民银行）相关文档" in md
+    assert "xinhua_pbc" in md
+
+
+def test_report_carries_the_per_source_compliance_ledger():
+    """合规要看得见：每个源的 robots 判定、停用源不得有任何抓取。"""
+    md = render_markdown(_with_compliance(_result()))
+    assert "信息源与合规" in md
+    assert "pbc_xw" in md and "未启用" in md
+    assert "不发起任何请求" in md
+    assert "本地入库" in md
+
+    out = render_html(_with_compliance(_result()))
+    assert "信息源与合规" in out
+    assert "不发起网络请求" in out
+
+    payload = json.loads(render_json(_with_compliance(_result())))
+    assert payload["stats"]["sources_detail"][0]["robots"] == "allowed"

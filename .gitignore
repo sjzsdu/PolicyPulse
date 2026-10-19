@@ -9,6 +9,10 @@ data/cache/
 # JSON 是本机产物（快照字段保留绝对路径），不入库
 reports/*.json
 
+# 人工 inbound 目录：只保留目录骨架（.gitkeep），用户放进去的原稿不入库
+inbound/*/*
+!inbound/*/.gitkeep
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

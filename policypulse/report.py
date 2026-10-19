@@ -22,6 +22,25 @@ def relative_snapshot(path: str) -> str:
         return path
 
 
+def _compliance_lines(result: RunResult) -> list[str]:
+    """逐源合规台账：robots 判定 + 本轮文档数。停用/本地源明确写「不发起请求」。"""
+    rows = result.stats.get("sources_detail") or []
+    if not rows:
+        return []
+    lines = ["## 信息源与合规", "",
+             "| 源ID | 机构 | 状态 | robots 判定 | 判定依据 | 本轮文档 |",
+             "|---|---|---|---|---|---|"]
+    for row in rows:
+        flag = "启用" if row["enabled"] else "停用"
+        reason = row["robots_reason"]
+        if len(reason) > 60:
+            reason = reason[:59] + "…"
+        lines.append(f"| `{row['id']}` | {row['org']} | {flag} | {row['robots']} | "
+                     f"{reason} | {row['docs']} |")
+    lines.append("")
+    return lines
+
+
 def render_markdown(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
@@ -46,6 +65,10 @@ def render_markdown(result: RunResult) -> str:
     lines.append(f"| 跨 run 去重跳过 | {s.get('duplicates_skipped', 0)} |")
     lines.append(f"| LLM 抽取 | {'开启' if s['llm_enabled'] else '关闭（规则抽取）'} |")
     lines.append(f"| tongstock 调用（不含缓存命中） | {s['tongstock_calls']} |")
+    pbc_docs = s.get("pbc_related_docs", 0)
+    pbc_src = s.get("pbc_related_sources") or []
+    lines.append(f"| 央行（中国人民银行）相关文档 | {pbc_docs}"
+                 f"{'（来源：' + '、'.join(pbc_src) + '）' if pbc_src else ''} |")
     lines.append("")
     lines.append(f"> 口径说明：{MAPPING_CAVEAT}")
     lines.append("")
@@ -120,6 +143,8 @@ def render_markdown(result: RunResult) -> str:
                          f"{c['summary'][:40]} | [{c['org']}]({c['source_url']}) |")
         lines.append("")
 
+    lines.extend(_compliance_lines(result))
+
     lines.append("## 运行元信息")
     lines.append("")
     snap_dir = Path(result.docs[0].snapshot_path).parent if result.docs else None
@@ -170,6 +195,19 @@ def render_html(result: RunResult) -> str:
             f"<th>score</th><th>理由</th><th>溯源</th></tr></thead><tbody>{trows}</tbody></table></section>"
         )
 
+    compliance = ""
+    rows_detail = s.get("sources_detail") or []
+    if rows_detail:
+        cells = "".join(
+            f"<tr><td>{_esc(r['id'])}</td><td>{_esc(r['org'])}</td>"
+            f"<td>{'启用' if r['enabled'] else '停用'}</td><td>{_esc(r['robots'])}</td>"
+            f"<td>{_esc(r['robots_reason'])}</td><td>{r['docs']}</td></tr>"
+            for r in rows_detail)
+        compliance = (
+            "<h2>信息源与合规</h2><table><thead><tr><th>源ID</th><th>机构</th><th>状态</th>"
+            "<th>robots 判定</th><th>判定依据</th><th>本轮文档</th></tr></thead>"
+            f"<tbody>{cells}</tbody></table>")
+
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PolicyPulse 日报 {_esc(result.window_end)}</title>
 <style>
@@ -186,8 +224,9 @@ th{{background:#f5f5f5}}
 <h1>PolicyPulse 日报 {_esc(result.window_end)}</h1>
 <p class="disc">{_esc(DISCLAIMER)}</p>
 <p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
-<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']}</p>
+<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
 {''.join(rows) or '<p>本轮没有命中「利好且有板块映射」的信号。</p>'}
+{compliance}
 <p class="disc">{_esc(DISCLAIMER)}</p>
 </body></html>"""
 

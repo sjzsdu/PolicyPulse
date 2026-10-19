@@ -24,6 +24,8 @@ class HtmlListAdapter:
 
         link_pat = re.compile(spec.extra["link_pattern"])
         reject_pat = re.compile(spec.extra["reject_pattern"]) if spec.extra.get("reject_pattern") else None
+        # 转载源用：只有标题命中的才收（例如只收央行相关通稿）
+        title_pat = re.compile(spec.extra["title_pattern"]) if spec.extra.get("title_pattern") else None
         min_len = int(spec.extra.get("min_title_length", 8))
         max_items = int(spec.extra.get("max_items", 40))
 
@@ -37,6 +39,8 @@ class HtmlListAdapter:
             if not link_pat.search(href):
                 continue
             if reject_pat and reject_pat.search(href):
+                continue
+            if title_pat and not title_pat.search(title):
                 continue
             url = absolutize(href, spec.url)
             if url in seen:
