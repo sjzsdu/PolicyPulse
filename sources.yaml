@@ -84,4 +84,6 @@ sources:
     link_pattern: '/goutongjiaoliu/113456/113469/\d+/index\.html$'
     max_items: 30
     min_title_length: 10
-    enabled: true
+    # 央行 robots.txt 明确 "User-agent: * / Disallow: /"，尊重其意愿，默认不接入。
+    # 抓之前会先读 robots；若哪天放行，把 enabled 改回 true 即可。
+    enabled: false

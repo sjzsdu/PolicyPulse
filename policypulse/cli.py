@@ -32,6 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--sources", nargs="*", default=None, help="只跑指定 source id")
     p_run.add_argument("--sources-file", type=Path, default=None)
     p_run.add_argument("--refresh-market", action="store_true", help="强制刷新 tongstock 板块/个股缓存")
+    p_run.add_argument("--no-dedupe", action="store_true",
+                       help="关闭跨 run 去重，重跑当天也重新抽取")
     p_run.add_argument("--no-report", action="store_true", help="只落库不出报告")
 
     p_show = sub.add_parser("show", help="打印一个信号的完整溯源链")
@@ -50,6 +52,8 @@ def cmd_run(args) -> int:
     settings = load_settings()
     if args.lookback_days:
         settings.lookback_days = args.lookback_days
+    if args.no_dedupe:
+        settings.cross_run_dedupe = False
     paths = default_paths()
 
     target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
@@ -61,9 +65,12 @@ def cmd_run(args) -> int:
     print(f"[policypulse] docs={result.stats['docs']} signals={result.stats['signals']} "
           f"ticker_rows={result.stats['ticker_rows']} "
           f"sources_ok={result.stats['sources_total'] - result.stats['sources_failed']}/"
-          f"{result.stats['sources_total']} llm={'on' if result.stats['llm_enabled'] else 'off'}", flush=True)
+          f"{result.stats['sources_total']} llm={'on' if result.stats['llm_enabled'] else 'off'}"
+          f" dedupe_skipped={result.duplicates_skipped}", flush=True)
     for failure in result.failed_sources[:10]:
         print(f"[policypulse][warn] {failure}", flush=True)
+    for warning in result.warnings[:10]:
+        print(f"[policypulse][robots] {warning}", flush=True)
 
     if not args.no_report:
         written = write_reports(result, paths.reports)

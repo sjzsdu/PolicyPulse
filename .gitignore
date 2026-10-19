@@ -1,10 +1,14 @@
 # 运行期产物：数据库、原文快照、tongstock 缓存
-data/*.db
+data/*
+!data/theme_alias.csv
 data/snapshots/
 data/cache/
-!data/theme_alias.csv
+*.db
 
-# 日报产物本身入库（reports/ 下的 .md/.json/.html 是交付物）
+# 日报：Markdown / HTML 入库作为交付物与证据；
+# JSON 是本机产物（快照字段保留绝对路径），不入库
+reports/*.json
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

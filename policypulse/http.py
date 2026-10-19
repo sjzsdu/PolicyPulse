@@ -1,15 +1,25 @@
-"""带限速、重试与 UA 的抓取客户端。
+"""带限速、UA 与 robots.txt 约束的抓取客户端。
 
-只抓公开页面；单站点串行、请求间隔可配置；不做任何登录/验证码/付费墙绕过。
+只抓公开页面；单站点串行；不做任何登录/验证码/付费墙绕过。
+
+robots.txt 处理（需求 §1.2）：
+- 取得到 → 按 Allow/Disallow 判定，被禁的路径直接拒绝并留痕；
+- 取不到（403/404/302/超时）→ 判定依据缺失，走保守策略：仍抓公开页面，
+  但把该 host 的请求间隔抬到 `robots_unavailable_interval`，原因写进 warnings，
+  由日报告警区显式列出。
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import random
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import httpx
 
@@ -18,9 +28,76 @@ DEFAULT_UA = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 PolicyPulse/0.1 (personal research)"
 )
 
+log = logging.getLogger("policypulse.http")
+
 
 class FetchError(RuntimeError):
     pass
+
+
+class RobotsDisallowed(FetchError):
+    """robots.txt 明确禁止，不是抓取失败。"""
+
+
+@dataclass
+class RobotsPolicy:
+    """单个 host 的 robots 判定结果。"""
+
+    host: str
+    status: str  # allowed / disallowed / unavailable
+    parser: RobotFileParser | None = None
+    reason: str = ""
+
+    def allows(self, url: str) -> bool:
+        if self.status != "allowed":
+            return self.status == "unavailable"
+        return bool(self.parser and self.parser.can_fetch(DEFAULT_UA, url))
+
+
+class RobotsCache:
+    """每个 host 只取一次 robots.txt，结果与失败原因都缓存下来。"""
+
+    def __init__(self, timeout: float = 10.0, user_agent: str = DEFAULT_UA) -> None:
+        self.timeout = timeout
+        self.user_agent = user_agent
+        self._cache: dict[str, RobotsPolicy] = {}
+
+    def policy(self, url: str) -> RobotsPolicy:
+        host = urlparse(url).netloc
+        if host in self._cache:
+            return self._cache[host]
+        policy = self._fetch(url, host)
+        self._cache[host] = policy
+        return policy
+
+    def _parse_or_unavailable(self, body: str | None, host: str, reason: str = "") -> RobotsPolicy:
+        """把 robots 文本解析成策略；拿不到就落成 unavailable 并记下原因。"""
+        if not body:
+            return RobotsPolicy(host, "unavailable", None, reason or "robots.txt 不可获取")
+        parser = RobotFileParser()
+        parser.set_url(f"https://{host}/robots.txt")
+        parser.parse(body.splitlines())
+        return RobotsPolicy(host, "allowed", parser, "robots.txt 已获取")
+
+    def _fetch(self, url: str, host: str) -> RobotsPolicy:
+        parts = urlparse(url)
+        robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
+        try:
+            req = urllib.request.Request(robots_url, headers={"User-Agent": self.user_agent})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                final_url = resp.geturl()
+                body = resp.read().decode("utf-8", errors="replace")
+            # 302 到 HTML 错误页 / 空文件都算"拿不到"：当成规则解析会得出错误结论
+            if not final_url.rstrip("/").endswith("robots.txt"):
+                return self._parse_or_unavailable(None, host, f"robots.txt 被重定向到 {final_url}")
+            if "user-agent" not in body.lower():
+                return self._parse_or_unavailable(None, host, "robots.txt 内容不是 robots 格式")
+            return self._parse_or_unavailable(body, host)
+        except urllib.error.HTTPError as exc:
+            return self._parse_or_unavailable(None, host, f"robots.txt HTTP {exc.code}")
+        except Exception as exc:  # noqa: BLE001 - 302/超时/DNS 统一归为"拿不到"
+            return self._parse_or_unavailable(None, host,
+                                              f"robots.txt 不可获取: {type(exc).__name__}")
 
 
 @dataclass
@@ -30,7 +107,11 @@ class Fetcher:
     user_agent: str = DEFAULT_UA
     min_interval: float = 2.0
     verify_tls: bool = True
+    robots_unavailable_interval: float = 5.0
+    check_robots: bool = True
     _last_request_at: dict[str, float] = field(default_factory=dict)
+    _host_interval: dict[str, float] = field(default_factory=dict)
+    _warned_hosts: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self._client = httpx.Client(
@@ -39,6 +120,8 @@ class Fetcher:
             headers={"User-Agent": self.user_agent, "Accept-Language": "zh-CN,zh;q=0.9"},
             verify=self.verify_tls,
         )
+        self.robots = RobotsCache(user_agent=self.user_agent)
+        self.warnings: list[str] = []
 
     def close(self) -> None:
         self._client.close()
@@ -49,16 +132,48 @@ class Fetcher:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    # ---------- 限速 ----------
+    def configure_rate_limit(self, url: str, seconds: float) -> None:
+        """按 host 设置请求间隔；未配置的 host 用 min_interval。"""
+        self._host_interval[urlparse(url).netloc] = float(seconds)
+
+    def interval_for(self, url: str) -> float:
+        return self._host_interval.get(urlparse(url).netloc, self.min_interval)
+
     def _throttle(self, url: str) -> None:
-        host = url.split("//", 1)[-1].split("/", 1)[0]
+        host = urlparse(url).netloc
+        interval = self._host_interval.get(host, self.min_interval)
         last = self._last_request_at.get(host)
         if last is not None:
-            wait = self.min_interval - (time.monotonic() - last)
+            wait = interval - (time.monotonic() - last)
             if wait > 0:
                 time.sleep(wait)
         self._last_request_at[host] = time.monotonic()
 
+    # ---------- robots ----------
+    def _check_robots(self, url: str) -> None:
+        if not self.check_robots:
+            return
+        policy = self.robots.policy(url)
+        if policy.status == "allowed" and not policy.parser.can_fetch(self.user_agent, url):
+            raise RobotsDisallowed(f"robots.txt 禁止抓取 {url}")
+        if policy.status == "unavailable":
+            host = policy.host
+            conservative = max(self.robots_unavailable_interval, self.min_interval)
+            current = self._host_interval.get(host)
+            # 保守间隔优先于源自己声明的较小间隔，并只告警一次
+            if current is None or current < conservative:
+                self._host_interval[host] = conservative
+            if host not in self._warned_hosts:
+                self._warned_hosts.add(host)
+                msg = (f"{host}: {policy.reason}，无 robots 判定依据，"
+                       f"按保守间隔 {conservative}s 抓取")
+                self.warnings.append(msg)
+                log.warning(msg)
+
+    # ---------- 抓取 ----------
     def get_text(self, url: str) -> str:
+        self._check_robots(url)
         last_err: Exception | None = None
         for attempt in range(self.retries + 1):
             self._throttle(url)
@@ -67,6 +182,8 @@ class Fetcher:
                 if resp.status_code >= 400:
                     raise FetchError(f"HTTP {resp.status_code} for {url}")
                 return decode_response(resp)
+            except RobotsDisallowed:
+                raise
             except Exception as exc:  # noqa: BLE001 - 网络错误统一收敛
                 last_err = exc
                 if attempt < self.retries:

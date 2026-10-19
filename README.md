@@ -5,25 +5,38 @@
 
 > 结论是"政策受益度排序 + 理由"，**不是涨幅预测，不是买卖点**。所有产物自带免责声明。
 
-## 一条命令跑通
+## 安装方式（重要）
+
+**只支持 editable 安装**：
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
+```
 
+不要 `pip install .`（非 editable）。`sources.yaml` 与 `data/theme_alias.csv` 是随仓库走的
+数据文件，`config.py` 按仓库根定位它们，打进 wheel 的非 editable 安装会找不到。
+package-data 方案未采用——这个选择是明确的，不是两可。
+
+## 一条命令跑通
+
+```bash
 policypulse selftest          # 先确认 tongstock / 网络 / LLM 三件事的状态
 policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出日报
 ```
 
+常用开关：`--date`、`--lookback-days N`、`--sources <id...>`、`--refresh-market`、
+`--no-dedupe`（当天重跑时关掉跨 run 去重）。
+
 跑完的产物：
 
-- `reports/YYYY-MM-DD.md` — 日报（主交付）
-- `reports/YYYY-MM-DD.json` — 同一批结论的结构化版本
-- `reports/YYYY-MM-DD.html` — 单页只读展示
+- `reports/YYYY-MM-DD.md` — 日报（主交付，快照路径写成**相对仓库根**，入库）
+- `reports/YYYY-MM-DD.html` — 单页只读展示（入库）
+- `reports/YYYY-MM-DD.json` — 同一批结论的结构化版本（**不入库**，含本机绝对路径）
 - `data/policypulse.db` — SQLite：documents / signals / signal_ticker / runs …
-- `data/snapshots/<run_id>/*.html` — 原文快照
+- `data/snapshots/<run_id>/*.html` — 原文快照（不入库）
 
-`仓库根目录/reports/2026-10-19.md` 是本机真实跑出来的一份，可以直接打开看效果。
+`reports/2026-10-19.md` 是本机真实跑出来的一份，可以直接打开看效果。
 
 其它命令：
 
@@ -61,12 +74,40 @@ sources.yaml 入口页
   → 板块成分股展开 → 过滤（ST、市值<30亿、北交所）→ 打分排序 → 落库 → 出日报
 ```
 
+### 抓取合规
+
+- **限速**：单 host 串行，间隔由 `sources.yaml` 的 `rate_limit_seconds` 下发（当前全部 2.0s）。
+- **UA**：显式声明 `PolicyPulse/0.1 (personal research)`。
+- **robots.txt**：按站读取并遵守。取得到就按 Allow/Disallow 判定，被禁路径直接拒绝；
+  取不到（403 / 404 / 302 / 超时）视为**判定依据缺失**——走保守策略：仍抓公开页面，
+  但把该 host 的间隔抬到 `robots_unavailable_interval`（默认 5s），
+  并把原因写进日报告警区（如 `www.ndrc.gov.cn: robots.txt HTTP 403，无判定依据，按保守间隔 5.0s 抓取`）。
+- 只抓公开页面，不绕登录 / 验证码 / 付费墙。
+
+### 去重与兜底
+
+- 单次 run 内按正文 `content_hash` 去重；**跨 run 也去重**（指纹已在库则不再重复抽取），
+  当天要重跑用 `--no-dedupe`。被跳过的条数写在日报概览里。
+- 某栏目在统计窗口内无更新时，会退回去抓入口页最近几条以保证链路有素材；
+  这些文档在产物里标注 `窗口外兜底`，概览里也有条数，不会静默混进当天结论。
+
+### 映射口径
+
+概念板块成分由第三方（通达信）维护，宽口径，可能包含非核心主题个股；
+本表是政策主题映射结果，不代表个股基本面判断。这句话固定出现在 Markdown「今日概览」
+下方和 HTML 顶部，不只写在文档里。
+
 ### 反幻觉硬校验
 
 - 每条信号的 `quote` **必须是原文子串**（归一化空白后比对），不通过则置信度压到 ≤0.4。
 - 结论必须带 `source_url` + 原文片段 + `fetched_at`，缺一不产出。
-- `policypulse verify` 重抓原文，报告「一致 / 内容已变 / 链接失效 / 抓取失败」三/四种状态。
-  原文指纹取**可见文本**，避开脚本注入的计数器噪声。
+- `policypulse verify` 重抓原文，报告「一致 / 内容已变 / 链接失效 / **被限速、暂不可验** / 抓取失败」。
+  429 / 503 归到被限速，不算链接失效。原文指纹取**可见文本**，避开脚本注入的计数器噪声。
+
+### 日报口径
+
+Markdown 正文只收「利好 + 有板块映射 + `strength >= min_strength_for_report`」（默认 3）；
+被力度门槛滤掉的条数写在概览里，完整结论在同日 JSON 与数据库中，不静默丢。
 
 ### 打分
 

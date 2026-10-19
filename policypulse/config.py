@@ -17,6 +17,12 @@ DISCLAIMER = (
     "不构成任何投资建议；个股仅为政策主题映射结果，不代表公司基本面判断或收益承诺。"
 )
 
+# 映射口径标注：概念板块成分由第三方维护，产物里必须显式说明
+MAPPING_CAVEAT = (
+    "概念板块成分由第三方（通达信）维护，宽口径，可能包含非核心主题个股；"
+    "本表为政策主题映射结果，不代表个股基本面判断。"
+)
+
 
 @dataclass
 class Paths:
@@ -79,6 +85,10 @@ class Settings:
     min_strength_for_report: int = 3
     request_timeout: float = 25.0
     request_retries: int = 2
+    # robots.txt 拿不到时的保守请求间隔（秒）
+    robots_unavailable_interval: float = 5.0
+    # 跨 run 去重：正文指纹已入库则不再重复抽取
+    cross_run_dedupe: bool = True
     user_agent: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 PolicyPulse/0.1 (personal research)"
