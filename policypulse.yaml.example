@@ -1,0 +1,20 @@
+# 可选：不想用默认值时改这里。缺省时 policypulse 用 Settings 的内置默认值。
+lookback_days: 14
+max_docs_per_source: 12
+min_confidence: 0.45
+
+weights:
+  strength: 0.35
+  relevance: 0.25
+  liquidity: 0.20
+  breadth: 0.10
+  novelty: 0.10
+
+min_market_cap_yi: 30.0
+exclude_bj: true
+top_n_per_sector: 5
+max_tickers_per_signal: 10
+
+request_timeout: 25.0
+request_retries: 2
+tongstock_cache_ttl_hours: 24

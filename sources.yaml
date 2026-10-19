@@ -1,0 +1,87 @@
+# PolicyPulse 信息源清单
+#
+# 每个源只声明「入口 + 定位规则」，不硬编码深链；栏目改版时改这里即可。
+# adapter:
+#   gov_json_feed - 中国政府网栏目页渲染所用的静态 JSON 列表
+#   html_list     - 通用 HTML 列表页，按 link_pattern 做链接发现
+
+sources:
+  - id: gov_zhengce
+    name: 最新政策
+    org: 国务院
+    tier: 中央
+    adapter: gov_json_feed
+    url: https://www.gov.cn/zhengce/zuixin/
+    column: 政策 > 最新政策
+    meeting_type_hint: 政策文件
+    rate_limit_seconds: 2.0
+    feed_url: https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json
+    enabled: true
+
+  - id: gov_yaowen
+    name: 时政要闻
+    org: 国务院
+    tier: 中央
+    adapter: gov_json_feed
+    url: https://www.gov.cn/xinwen/yaowen/
+    column: 新闻 > 要闻（含国务院常务会议）
+    meeting_type_hint: 会议
+    rate_limit_seconds: 2.0
+    feed_url: https://www.gov.cn/xinwen/yaowen/TONGYONGGAILAN.json
+    enabled: true
+
+  - id: ndrc_xwfb
+    name: 新闻发布
+    org: 发改委
+    tier: 部委
+    adapter: html_list
+    url: https://www.ndrc.gov.cn/xwdt/xwfb/
+    column: 新闻发布
+    meeting_type_hint: 新闻发布会
+    rate_limit_seconds: 2.0
+    link_pattern: 't\d{8}_\d+\.html$'
+    max_items: 30
+    min_title_length: 10
+    enabled: true
+
+  - id: mof_czxw
+    name: 财政新闻
+    org: 财政部
+    tier: 部委
+    adapter: html_list
+    url: https://www.mof.gov.cn/zhengwuxinxi/caizhengxinwen/
+    column: 财政新闻
+    meeting_type_hint: 会议
+    rate_limit_seconds: 2.0
+    link_pattern: 't\d{8}_\d+\.htm'
+    max_items: 30
+    min_title_length: 10
+    enabled: true
+
+  - id: mofcom_xwfb
+    name: 新闻发布
+    org: 商务部
+    tier: 部委
+    adapter: html_list
+    url: http://www.mofcom.gov.cn/xwfb/index.html
+    column: 新闻发布
+    meeting_type_hint: 会议
+    rate_limit_seconds: 2.0
+    link_pattern: '/art/\d{4}/art_'
+    max_items: 30
+    min_title_length: 10
+    enabled: true
+
+  - id: pbc_xw
+    name: 新闻
+    org: 中国人民银行
+    tier: 部委
+    adapter: html_list
+    url: http://www.pbc.gov.cn/goutongjiaoliu/113456/113469/index.html
+    column: 新闻发布
+    meeting_type_hint: 会议
+    rate_limit_seconds: 2.0
+    link_pattern: '/goutongjiaoliu/113456/113469/\d+/index\.html$'
+    max_items: 30
+    min_title_length: 10
+    enabled: true
