@@ -78,10 +78,18 @@ sources.yaml 入口页
 
 - **限速**：单 host 串行，间隔由 `sources.yaml` 的 `rate_limit_seconds` 下发（当前全部 2.0s）。
 - **UA**：显式声明 `PolicyPulse/0.1 (personal research)`。
-- **robots.txt**：按站读取并遵守。取得到就按 Allow/Disallow 判定，被禁路径直接拒绝；
-  取不到（403 / 404 / 302 / 超时）视为**判定依据缺失**——走保守策略：仍抓公开页面，
-  但把该 host 的间隔抬到 `robots_unavailable_interval`（默认 5s），
-  并把原因写进日报告警区（如 `www.ndrc.gov.cn: robots.txt HTTP 403，无判定依据，按保守间隔 5.0s 抓取`）。
+- **robots.txt**：按站读取并遵守，判定分四档（见 `policypulse/http.py`）：
+
+  | 档位 | 含义 | 行为 |
+  |---|---|---|
+  | `allowed` | 取到规则 | 按 Allow/Disallow 判定，被禁路径直接拒绝 |
+  | `disallowed` | 规则明确禁止 | 不抓 |
+  | `unavailable` | **拿到 HTTP 响应**但无可用规则（403 / 404 / 302 到 HTML / 内容不是 robots 格式） | 保守策略：仍抓公开页面，该 host 间隔抬到 `robots_unavailable_interval`（默认 5s），原因进日报告警区 |
+  | `error` | **没拿到响应**（TLS 校验失败 / 连接失败 / 超时） | **fail-closed，不抓**，显式报错进告警区 |
+
+  关键一点：`error` 绝不能退化成 `unavailable` 照抓——否则遇到真 `Disallow: /`
+  的站会静默违规。robots 请求复用正文抓取那个 `httpx.Client`，不另起 `urllib`：
+  两套 TLS 栈的 CA / 代理配置不同，同一台机器上可能一个通一个不通，会让档位静默翻转。
 - 只抓公开页面，不绕登录 / 验证码 / 付费墙。
 
 ### 去重与兜底

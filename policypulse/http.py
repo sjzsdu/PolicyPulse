@@ -2,11 +2,19 @@
 
 只抓公开页面；单站点串行；不做任何登录/验证码/付费墙绕过。
 
-robots.txt 处理（需求 §1.2）：
-- 取得到 → 按 Allow/Disallow 判定，被禁的路径直接拒绝并留痕；
-- 取不到（403/404/302/超时）→ 判定依据缺失，走保守策略：仍抓公开页面，
-  但把该 host 的请求间隔抬到 `robots_unavailable_interval`，原因写进 warnings，
-  由日报告警区显式列出。
+robots.txt 处理（需求 §1.2），判定分四档，绝不含糊：
+
+- `allowed`    —— 取到规则，按 Allow/Disallow 判定，被禁路径直接拒绝；
+- `disallowed` —— 规则明确禁止该路径；
+- `unavailable`—— **拿到了 HTTP 响应**但无可用规则（403/404/302 到 HTML/内容不是
+                  robots 格式）：走保守策略，仍抓公开页面，但把该 host 间隔抬到
+                  `robots_unavailable_interval`，原因写进 warnings 与日报告警区；
+- `error`      —— **根本没拿到响应**（TLS 校验失败 / 连接失败 / 超时）：无法判定，
+                  **fail-closed，不抓**，并显式报错进告警区。这一档绝不能退化成
+                  "unavailable 照抓"，否则遇到真 `Disallow: /` 的站会静默违规。
+
+robots 请求复用 Fetcher 的同一个 `httpx.Client`：两套 TLS 栈（urllib vs httpx）
+的 CA / 代理配置不同，同一台机器上可能一个通一个不通，会让上面四档静默翻转。
 """
 
 from __future__ import annotations
@@ -15,8 +23,6 @@ import hashlib
 import logging
 import random
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -39,28 +45,46 @@ class RobotsDisallowed(FetchError):
     """robots.txt 明确禁止，不是抓取失败。"""
 
 
+class RobotsUnverifiable(FetchError):
+    """robots.txt 取不到响应，无法判定：按不抓取处理，不静默放行。"""
+
+
 @dataclass
 class RobotsPolicy:
     """单个 host 的 robots 判定结果。"""
 
     host: str
-    status: str  # allowed / disallowed / unavailable
+    status: str  # allowed / unavailable / error
     parser: RobotFileParser | None = None
     reason: str = ""
 
     def allows(self, url: str) -> bool:
-        if self.status != "allowed":
-            return self.status == "unavailable"
-        return bool(self.parser and self.parser.can_fetch(DEFAULT_UA, url))
+        if self.status == "allowed":
+            return bool(self.parser and self.parser.can_fetch(DEFAULT_UA, url))
+        if self.status == "unavailable":
+            return True  # 无规则可依，走保守限速抓取
+        return False  # error：无法判定，不抓
 
 
 class RobotsCache:
-    """每个 host 只取一次 robots.txt，结果与失败原因都缓存下来。"""
+    """每个 host 只取一次 robots.txt，结果、状态与失败原因都缓存下来。
 
-    def __init__(self, timeout: float = 10.0, user_agent: str = DEFAULT_UA) -> None:
+    `client` 必须是 Fetcher 那个 `httpx.Client`——不另起 urllib，避免两套 TLS 栈
+    给出不同结论。
+    """
+
+    def __init__(self, client: httpx.Client | None = None, timeout: float = 10.0,
+                 user_agent: str = DEFAULT_UA) -> None:
+        self.client = client
         self.timeout = timeout
         self.user_agent = user_agent
         self._cache: dict[str, RobotsPolicy] = {}
+
+    def _http(self) -> httpx.Client:
+        if self.client is None:  # 独立使用时的兜底，不该在正常链路发生
+            self.client = httpx.Client(timeout=self.timeout, follow_redirects=True,
+                                       headers={"User-Agent": self.user_agent})
+        return self.client
 
     def policy(self, url: str) -> RobotsPolicy:
         host = urlparse(url).netloc
@@ -83,21 +107,21 @@ class RobotsCache:
         parts = urlparse(url)
         robots_url = f"{parts.scheme}://{parts.netloc}/robots.txt"
         try:
-            req = urllib.request.Request(robots_url, headers={"User-Agent": self.user_agent})
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                final_url = resp.geturl()
-                body = resp.read().decode("utf-8", errors="replace")
-            # 302 到 HTML 错误页 / 空文件都算"拿不到"：当成规则解析会得出错误结论
-            if not final_url.rstrip("/").endswith("robots.txt"):
-                return self._parse_or_unavailable(None, host, f"robots.txt 被重定向到 {final_url}")
-            if "user-agent" not in body.lower():
-                return self._parse_or_unavailable(None, host, "robots.txt 内容不是 robots 格式")
-            return self._parse_or_unavailable(body, host)
-        except urllib.error.HTTPError as exc:
-            return self._parse_or_unavailable(None, host, f"robots.txt HTTP {exc.code}")
-        except Exception as exc:  # noqa: BLE001 - 302/超时/DNS 统一归为"拿不到"
-            return self._parse_or_unavailable(None, host,
-                                              f"robots.txt 不可获取: {type(exc).__name__}")
+            resp = self._http().get(robots_url, timeout=self.timeout)
+        except httpx.HTTPError as exc:
+            # 传输层失败 ≠ 站点没有 robots：这一档必须 fail-closed
+            return RobotsPolicy(host, "error", None,
+                                f"robots.txt 传输失败（{type(exc).__name__}）: {exc}")
+        if resp.status_code >= 400:
+            return self._parse_or_unavailable(None, host, f"robots.txt HTTP {resp.status_code}")
+        # 302 到 HTML 错误页 / 空文件都算"没有规则"：当成规则解析会得出错误结论
+        final_url = str(resp.url)
+        if not final_url.rstrip("/").endswith("robots.txt"):
+            return self._parse_or_unavailable(None, host, f"robots.txt 被重定向到 {final_url}")
+        body = resp.text
+        if "user-agent" not in body.lower():
+            return self._parse_or_unavailable(None, host, "robots.txt 内容不是 robots 格式")
+        return self._parse_or_unavailable(body, host)
 
 
 @dataclass
@@ -120,11 +144,17 @@ class Fetcher:
             headers={"User-Agent": self.user_agent, "Accept-Language": "zh-CN,zh;q=0.9"},
             verify=self.verify_tls,
         )
-        self.robots = RobotsCache(user_agent=self.user_agent)
+        self.robots = RobotsCache(client=self._client, timeout=self.timeout,
+                                  user_agent=self.user_agent)
         self.warnings: list[str] = []
 
     def close(self) -> None:
         self._client.close()
+
+    @property
+    def client(self) -> httpx.Client:
+        """对外暴露同一个 httpx.Client，便于断言 robots 与正文共用一套传输栈。"""
+        return self._client
 
     def __enter__(self) -> "Fetcher":
         return self
@@ -157,6 +187,9 @@ class Fetcher:
         policy = self.robots.policy(url)
         if policy.status == "allowed" and not policy.parser.can_fetch(self.user_agent, url):
             raise RobotsDisallowed(f"robots.txt 禁止抓取 {url}")
+        if policy.status == "error":
+            # 拿不到响应就无法判定，fail-closed：不抓，并留痕
+            raise RobotsUnverifiable(f"{policy.host}: {policy.reason}，无法判定，按不抓取处理")
         if policy.status == "unavailable":
             host = policy.host
             conservative = max(self.robots_unavailable_interval, self.min_interval)

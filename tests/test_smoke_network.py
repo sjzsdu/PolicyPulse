@@ -11,10 +11,14 @@ from policypulse.http import Fetcher
 from policypulse.sources.registry import get_adapter
 
 
+def _enabled_source_ids() -> list[str]:
+    """只测启用的源：关闭的源（如央行 robots 禁止）不该要求它能抓。"""
+    return [s.id for s in load_sources() if s.enabled]
+
+
 @pytest.mark.network
-@pytest.mark.parametrize("source_id", ["gov_zhengce", "gov_yaowen", "ndrc_xwfb",
-                                       "mof_czxw", "mofcom_xwfb", "pbc_xw"])
-def test_each_configured_source_discovers_items(source_id):
+@pytest.mark.parametrize("source_id", _enabled_source_ids())
+def test_each_enabled_source_discovers_items(source_id):
     spec = next(s for s in load_sources() if s.id == source_id)
     with Fetcher(min_interval=0.5) as fetcher:
         items = get_adapter(spec).discover(spec, fetcher)
