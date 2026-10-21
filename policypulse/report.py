@@ -107,7 +107,8 @@ def render_markdown(result: RunResult) -> str:
     if warned:
         lines.append("### 抓取告警")
         lines.append("")
-        for item in warned[:15]:
+        # 30：窗口外剔除改为逐条告警后，15 条会把明细截掉，数字就不可回溯了
+        for item in warned[:30]:
             lines.append(f"- {item}")
         lines.append("")
 

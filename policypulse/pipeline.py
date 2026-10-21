@@ -223,6 +223,10 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
             if not _in_window(published, window_start, window_end):
                 dropped_out_of_window += 1
                 diag["out_of_window_docs"] += 1
+                # 剔除发生在快照落盘之前，产物里不留文档明细；告警是唯一可回溯出口
+                warnings.append(
+                    f"{spec.id}: 窗口外剔除 {item.url}（详情页日期 {published} ∉ "
+                    f"[{window_start}, {window_end}]）")
                 continue
 
             digest = content_hash(body)

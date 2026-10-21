@@ -50,6 +50,21 @@ def test_markdown_lists_signal_traceability_fields():
         assert field in md
 
 
+def test_markdown_keeps_all_out_of_window_warning_details():
+    """窗口外剔除改为逐条告警后，明细不能被旧的 15 条展示上限截断。"""
+    r = _result()
+    r.warnings = [
+        f"mofcom_xw: 窗口外剔除 https://example.com/{i}.htm"
+        f"（详情页日期 2026-10-14 ∉ [2026-10-19, 2026-10-20]）"
+        for i in range(20)
+    ]
+    md = render_markdown(r)
+    shown = [line for line in md.splitlines()
+             if line.startswith("- ") and "窗口外剔除" in line]
+    assert len(shown) == 20, "20 条剔除明细必须全部可见"
+    assert "https://example.com/19.htm" in md, "最后一条也不能被截断"
+
+
 def test_markdown_deepdive_sources_line_renders():
     """深度研读的溯源行：渲染正确且不依赖 3.12+ 的嵌套同引号 f-string。"""
     from policypulse.deepdive import DeepDive
