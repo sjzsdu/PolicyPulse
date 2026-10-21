@@ -69,3 +69,45 @@ def extract_with_llm(title: str, body: str, timeout: float = 60.0) -> list[dict]
     if start < 0 or end < 0:
         return []
     return json.loads(content[start : end + 1])
+
+
+DEEPDIVE_PROMPT_VERSION = "llm-deepdive-v1"
+
+_DEEPDIVE_SYSTEM = (
+    "你是政策研究员。给定一条政策原文片段与一家上市公司的公开业务资料，"
+    "判断该政策对该公司的传导路径。只输出一个 JSON 对象，字段："
+    "transmission(直接/间接/中性), competition(一句话竞争地位，≤60字), "
+    "impact(一句话影响判断，≤80字), risks(数组，≤3条，每条≤40字), "
+    "sources(数组，每项 {label, ref}，ref 必须是给定的政策原文 URL 或 通达信F10:<code>)。"
+    "资料里没有的事实不得写入结论；写不出就返回 {}。"
+)
+
+
+def deepdive_with_llm(policy_text: str, profile_text: str, timeout: float = 60.0) -> dict | None:
+    """个股深度研读：返回模型原始 JSON；调用方必须再做溯源硬校验。"""
+    base, key, model = _config()
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": _DEEPDIVE_SYSTEM},
+            {"role": "user", "content": f"【政策】\n{policy_text[:4000]}\n\n【公司公开资料】\n{profile_text[:6000]}"},
+        ],
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",
+                 "User-Agent": DEFAULT_UA},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    content = data["choices"][0]["message"]["content"]
+    start, end = content.find("{"), content.rfind("}")
+    if start < 0 or end < 0:
+        return None
+    try:
+        return json.loads(content[start : end + 1])
+    except json.JSONDecodeError:
+        return None

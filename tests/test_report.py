@@ -11,7 +11,8 @@ def _result() -> RunResult:
     r.stats = {
         "docs": 3, "signals": 4, "with_tickers": 1, "ticker_rows": 2,
         "sources_total": 6, "sources_failed": 1, "tongstock_calls": 5, "llm_enabled": False,
-        "duplicates_skipped": 0, "min_strength_for_report": 3,
+        "duplicates_skipped": 0, "sources_no_update": [], "events": 1,
+        "gate": {}, "deepdive_count": 0, "min_strength_for_report": 3,
     }
     r.failed_sources = ["miit: timeout"]
     r.conclusions = [{
@@ -47,6 +48,41 @@ def test_markdown_lists_signal_traceability_fields():
     md = render_markdown(_result())
     for field in ("信号ID", "引用校验", "快照", "映射路径"):
         assert field in md
+
+
+def test_markdown_keeps_all_out_of_window_warning_details():
+    """窗口外剔除改为逐条告警后，明细不能被旧的 15 条展示上限截断。"""
+    r = _result()
+    r.warnings = [
+        f"mofcom_xw: 窗口外剔除 https://example.com/{i}.htm"
+        f"（详情页日期 2026-10-14 ∉ [2026-10-19, 2026-10-20]）"
+        for i in range(20)
+    ]
+    md = render_markdown(r)
+    shown = [line for line in md.splitlines()
+             if line.startswith("- ") and "窗口外剔除" in line]
+    assert len(shown) == 20, "20 条剔除明细必须全部可见"
+    assert "https://example.com/19.htm" in md, "最后一条也不能被截断"
+
+
+def test_markdown_deepdive_sources_line_renders():
+    """深度研读的溯源行：渲染正确且不依赖 3.12+ 的嵌套同引号 f-string。"""
+    from policypulse.deepdive import DeepDive
+
+    r = _result()
+    r.deepdives = [DeepDive(
+        ticker_code="600001", ticker_name="测试A", policy_title="发展新质生产力",
+        policy_summary="加快培育低空经济", policy_quote="加快培育低空经济新增长极",
+        policy_url="https://www.gov.cn/a.htm", profile_business="航空装备制造",
+        transmission="政策直接利好", competition="龙头地位稳固", impact="订单增加",
+        risks=["落地不及预期"],
+        sources=[{"label": "政策原文", "ref": "https://www.gov.cn/a.htm"},
+                 {"label": "公司画像", "ref": "通达信F10:600001"}],
+    )]
+    md = render_markdown(r)
+    assert ("- 溯源：政策原文（`https://www.gov.cn/a.htm`）; "
+            "公司画像（`通达信F10:600001`）") in md
+    assert "风险提示：落地不及预期" in md
 
 
 def test_json_is_parseable_and_complete():
@@ -93,26 +129,40 @@ def test_markdown_snapshot_path_is_relative(tmp_path):
     assert Path(payload["conclusions"][0]["raw_snapshot_path"]).is_absolute()
 
 
-def test_empty_report_declares_no_new_items():
-    """空日报必须显式写「今日无新增政策/事件」，不再兜底抓旧文（WAN-11 第 1 点）。"""
-    r = RunResult(run_id="r2", window_start="2026-10-18", window_end="2026-10-19")
-    r.stats = {
-        "docs": 0, "signals": 0, "with_tickers": 0, "ticker_rows": 0,
-        "sources_total": 1, "sources_failed": 0, "tongstock_calls": 0, "llm_enabled": False,
-        "duplicates_skipped": 0, "min_strength_for_report": 3,
+def test_empty_day_reports_nothing_and_keeps_no_fallback_language():
+    """第 1 点：兜底抓旧的措辞必须彻底消失；窗口内没稿写「今日无新增政策 / 事件」。"""
+    from policypulse.config import EMPTY_DAY_NOTICE
+
+    empty = RunResult(run_id="r0", window_start="2026-10-19", window_end="2026-10-20")
+    empty.stats = {
+        "docs": 0, "signals": 0, "with_tickers": 0, "ticker_rows": 0, "events": 0,
+        "sources_total": 6, "sources_failed": 0, "sources_ok": 6,
+        "sources_no_update": ["gov_cn"], "tongstock_calls": 0, "llm_enabled": False,
+        "duplicates_skipped": 0, "min_strength_for_report": 3, "gate": {},
     }
+    empty.failed_sources = []
+    empty.warnings = []
+    md = render_markdown(empty)
+    assert EMPTY_DAY_NOTICE in md
+    assert "窗口外兜底" not in md
+    assert "gov_cn" in md, "哪些源没更新要如实写出来"
+
+    # 有产出的报告里同样不能残留兜底措辞
+    assert "窗口外兜底" not in render_markdown(_result())
+
+
+def test_markdown_states_the_company_gate():
+    md = render_markdown(_result())
+    assert "公司级相关性闸门" in md
+
+
+def test_markdown_labels_unparsed_profile_gate_rows():
+    """闸门统计里「F10 已取未解析」必须与「无画像」分两行标签显示。"""
+    r = _result()
+    r.stats["gate"] = {"no_profile": 1, "unparsed_profile": 2}
     md = render_markdown(r)
-    assert "今日无新增政策/事件" in md
-    assert "不再回退抓取旧文" in md
-    assert "窗口外兜底" not in md, "兜底口径已删除，产物里不应再出现"
-
-    out = render_html(r)
-    assert "今日无新增政策/事件" in out, "空日报的 HTML 也必须有声明，与 Markdown 对齐"
-    assert "窗口外兜底" not in out
-
-    payload = json.loads(render_json(r))
-    assert payload["window"]["start"] == "2026-10-18"
-    assert payload["conclusions"] == []
+    assert "无画像放行 1" in md
+    assert "F10已取未解析放行 2" in md
 
 
 def _with_compliance(result: RunResult) -> RunResult:

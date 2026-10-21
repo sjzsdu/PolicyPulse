@@ -131,20 +131,25 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+_DATE_PAT = r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})"
+
+
 def extract_publish_time(html: str, text: str = "") -> str:
-    """从页面里找发布时间，找不到返回空串（调用方用 fetched_at 兜底）。"""
-    patterns = [
-        r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})",
-    ]
-    hay = html[:200000]
-    for pat in patterns:
-        m = re.search(pat, hay)
-        if m:
-            y, mo, d = (int(x) for x in m.groups())
-            if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
-                return f"{y:04d}-{mo:02d}-{d:02d}"
-    m = re.search(r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})", text or "")
-    return m.group(0) if m else ""
+    """从页面里找发布时间，找不到返回空串（调用方用 fetched_at 兜底）。
+
+    html / text 两条路径必须返回同一种零填充 `YYYY-MM-DD`：`_in_window` 是裸字符串
+    比较，`2026年10月19`、`2026/10/19` 的分隔符码位大于 `-`，不归一会把窗口内稿件
+    判成窗口外（误杀还会被计入 out_of_window_docs，与真剔除混在一起）。
+    越界日期同样不返回原始串，交给调用方按「无日期」处理。
+    """
+    for hay in (html[:200000], text or ""):
+        m = re.search(_DATE_PAT, hay)
+        if not m:
+            continue
+        y, mo, d = (int(x) for x in m.groups())
+        if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{mo:02d}-{d:02d}"
+    return ""
 
 
 def split_sentences(text: str) -> list[str]:

@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from policypulse import llm
-from policypulse.config import default_paths, load_settings, load_sources
+from policypulse.config import EMPTY_DAY_NOTICE, default_paths, load_settings, load_sources
 from policypulse.pipeline import run as run_pipeline
 from policypulse.report import write_reports
 from policypulse.store import Store
@@ -28,9 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="抓取→抽取→映射→打分→出日报")
     p_run.add_argument("--date", help="目标日期 YYYY-MM-DD，默认今天")
-    p_run.add_argument("--since", nargs="?", const=0, default=None, type=int, metavar="N",
-                       help="显式补跑：收最近 N 天（--since 1 即只收当日；省略 N 则用配置 "
-                            "lookback_days）；不带此参数时日报固定只收 [昨日, 今日]")
+    p_run.add_argument("--since", type=int, default=None, dest="since_days", metavar="N",
+                       help="回补窗口：取 [目标日-N, 目标日] 的稿子；"
+                            "不传则只看默认的当天+前一天（防止旧稿混进今日日报）")
     p_run.add_argument("--sources", nargs="*", default=None, help="只跑指定 source id")
     p_run.add_argument("--sources-file", type=Path, default=None)
     p_run.add_argument("--refresh-market", action="store_true", help="强制刷新 tongstock 板块/个股缓存")
@@ -57,41 +57,40 @@ def cmd_run(args) -> int:
     paths = default_paths()
 
     target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-    # lookback_days 只在显式 --since 补跑时生效；默认日报恒为 [target-1, target]
-    since_days = args.since
-    if since_days == 0:
-        since_days = settings.lookback_days
-    if since_days:
-        print(f"[policypulse] 补跑模式 --since {since_days}d，窗口拉长到最近 {since_days} 天", flush=True)
-    else:
-        print(f"[policypulse] 默认窗口 = [{target - timedelta(days=1)}, {target}]"
-              f"（只收窗口内发布，不再回退抓旧文）", flush=True)
+    since = args.since_days if args.since_days is not None else settings.daily_window_days - 1
+    scope = "回补" if args.since_days is not None else "当日"
+    print(f"[policypulse] run window = {target} ({scope} {since}d, 窗口 ["
+          f"{target - timedelta(days=since)}, {target}])", flush=True)
 
     result = run_pipeline(settings, paths, target_date=target, sources_file=args.sources_file,
                           refresh_market=args.refresh_market, only_sources=args.sources,
-                          since_days=since_days)
+                          since_days=args.since_days)
 
     print(f"[policypulse] docs={result.stats['docs']} signals={result.stats['signals']} "
-          f"ticker_rows={result.stats['ticker_rows']} "
-          f"sources_ok={result.stats['sources_total'] - result.stats['sources_failed']}/"
-          f"{result.stats['sources_total']} llm={'on' if result.stats['llm_enabled'] else 'off'}"
+          f"events={result.stats['events']} ticker_rows={result.stats['ticker_rows']} "
+          f"sources_ok={result.stats['sources_ok']}/{result.stats['sources_total']} "
+          f"llm={'on' if result.stats['llm_enabled'] else 'off'}"
           f" dedupe_skipped={result.duplicates_skipped}", flush=True)
     for failure in result.failed_sources[:10]:
         print(f"[policypulse][warn] {failure}", flush=True)
     for warning in result.warnings[:10]:
-        print(f"[policypulse][robots] {warning}", flush=True)
+        print(f"[policypulse][warn] {warning}", flush=True)
 
     if not args.no_report:
         written = write_reports(result, paths.reports)
         print(f"[policypulse] report -> {written['markdown']}", flush=True)
         print(f"[policypulse] json   -> {written['json']}", flush=True)
         print(f"[policypulse] html   -> {written['html']}", flush=True)
-    if not result.conclusions:
-        if not result.docs and not result.failed_sources:
-            print("[policypulse] 今日无新增政策/事件", flush=True)
-            return 0
-        print("[policypulse] 本轮没有产出结论（可能是源不可达）", flush=True)
+
+    if result.conclusions:
+        return 0
+    if result.failed_sources:
+        # 抓取失败导致的空跑才是问题，得让 cron / 调用方看得见
+        print(f"[policypulse] 本轮抓取失败 {len(result.failed_sources)} 个源，无产出", flush=True)
         return 1
+    # 窗口内确实没有新稿：这是正常结果，日报如实写「今日无新增政策 / 事件」
+    print(f"[policypulse] {EMPTY_DAY_NOTICE}（窗口 {result.window_start} ~ "
+          f"{result.window_end}，抓取与映射均正常）", flush=True)
     return 0
 
 

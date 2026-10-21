@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS ticker_sector (
 CREATE TABLE IF NOT EXISTS signal_ticker (
   signal_id TEXT, code TEXT, why TEXT, score REAL, rank INTEGER,
   mapping_path TEXT, mapping_confidence REAL, sector_name TEXT, sector_source TEXT,
+  relevance REAL DEFAULT 1.0, gate_basis TEXT, gate_evidence TEXT,
   PRIMARY KEY (signal_id, code)
 );
 CREATE TABLE IF NOT EXISTS verify_log (
@@ -99,7 +100,19 @@ class Store:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。"""
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(signal_ticker)")}
+        for col, decl in (("relevance", "REAL"), ("gate_basis", "TEXT"),
+                          ("gate_evidence", "TEXT")):
+            if col not in columns:
+                self.conn.execute(f"ALTER TABLE signal_ticker ADD COLUMN {col} {decl}")
+                if col == "relevance":
+                    self.conn.execute("UPDATE signal_ticker SET relevance=mapping_confidence"
+                                      " WHERE relevance IS NULL")
 
     def close(self) -> None:
         self.conn.close()
@@ -212,13 +225,18 @@ class Store:
                       (code, sector, source))
 
     def upsert_signal_ticker(self, signal_id: str, code: str, why: str, score: float, rank_: int,
-                             mapping_path: str, mapping_confidence: float, sector: str, source: str) -> None:
+                             mapping_path: str, mapping_confidence: float, sector: str, source: str,
+                             *, relevance: float | None = None, gate_basis: str = "",
+                             gate_evidence: str = "") -> None:
         with self.tx() as c:
             c.execute(
                 "INSERT INTO signal_ticker(signal_id,code,why,score,rank,mapping_path,mapping_confidence,"
-                "sector_name,sector_source) VALUES(?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(signal_id,code) DO UPDATE SET score=excluded.score, rank=excluded.rank",
-                (signal_id, code, why, score, rank_, mapping_path, mapping_confidence, sector, source),
+                "sector_name,sector_source,relevance,gate_basis,gate_evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(signal_id,code) DO UPDATE SET score=excluded.score, rank=excluded.rank,"
+                " relevance=excluded.relevance, gate_basis=excluded.gate_basis,"
+                " gate_evidence=excluded.gate_evidence",
+                (signal_id, code, why, score, rank_, mapping_path, mapping_confidence, sector, source,
+                 relevance if relevance is not None else mapping_confidence, gate_basis, gate_evidence),
             )
 
     def tickers_for_signal(self, signal_id: str) -> list[sqlite3.Row]:

@@ -7,14 +7,13 @@ HTTP 层用冻结的**真实** gov.cn 页面，tongstock 层用一个最小数�
 from __future__ import annotations
 
 import json
-from datetime import date
 from pathlib import Path
 
 import pytest
 
 from policypulse.config import Settings, default_paths, load_theme_alias
 from policypulse.http import Fetcher
-from policypulse.pipeline import build_conclusions, doc_id_for, fetch_documents, run as run_pipeline
+from policypulse.pipeline import build_conclusions, doc_id_for, fetch_documents
 from policypulse.report import render_markdown
 from policypulse.store import Store
 from policypulse.tongstock import CONCEPT_FILE, INDUSTRY_FILE, Ticker
@@ -127,7 +126,7 @@ def test_end_to_end_offline(workspace):
         "stats": {"docs": 1, "signals": len(signals), "with_tickers": len(with_tickers),
                   "ticker_rows": len(codes), "sources_total": 1, "sources_failed": 0,
                   "tongstock_calls": 0, "llm_enabled": False, "duplicates_skipped": 0,
-                  "min_strength_for_report": 3},
+                  "sources_no_update": [], "gate": {}, "min_strength_for_report": 3},
     })())
     assert ARTICLE_URL in md
     assert "600989" in md
@@ -159,23 +158,12 @@ def test_dedupe_can_be_disabled(workspace):
     store.close()
 
 
-SOURCES_YAML = """sources:
-  - id: gov_zhengce
-    name: 最新政策
-    org: 国务院
-    tier: 中央
-    adapter: gov_json_feed
-    url: https://www.gov.cn/zhengce/zuixin/
-    column: 政策 > 最新政策
-    meeting_type_hint: 政策文件
-    rate_limit_seconds: 2.0
-    feed_url: https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json
-    enabled: true
-"""
+def test_out_of_window_documents_are_not_fetched(workspace):
+    """第 1 点：窗口内没有更新 = 不抓。
 
-
-def test_empty_window_does_not_fall_back_to_old_items(workspace):
-    """窗口内无更新就跳过该源：不回退抓入口页旧文凑数（WAN-11 第 1 点）。"""
+    旧实现会「退回抓入口页最近 3 条」，把 10 月的稿子塞进 1 月的日报；
+    现在必须是空结果 + 明确记录「该源窗口内无更新」。
+    """
     paths, snapshot_dir = workspace
     store = Store(paths.db)
     settings = Settings()
@@ -183,45 +171,102 @@ def test_empty_window_does_not_fall_back_to_old_items(workspace):
         "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
         ARTICLE_URL: ARTICLE,
     })
-    docs, _, _ = fetch_documents(fetcher, _specs(), settings, "2026-01-01", "2026-01-02",
-                                 snapshot_dir, "run-test", store)
-    assert docs == [], "窗口外旧文不能冒进当日产物"
-    assert ARTICLE_URL not in fetcher.requests, "兜底回抓旧文已被删除，不应请求正文页"
+    diag: dict = {}
+    docs, failed, dupes = fetch_documents(fetcher, _specs(), settings, "2026-01-01",
+                                          "2026-01-02", snapshot_dir, "run-test", store, diag)
+    assert docs == [], "窗口外的稿子一条都不能进产物"
+    assert failed == [] and dupes == 0, "源本身是可用的，只是窗口内没有更新"
+    assert diag["discovered"] == ["gov_zhengce"]
+    assert diag["no_update"] == ["gov_zhengce"]
     store.close()
 
 
-def test_default_window_is_yesterday_and_today__since_only_for_backfill(workspace):
-    """默认日报恒为 [target-1d, target]（lookback_days=14 不参与）；
-    --since N 显式补跑才拉长窗口（WAN-11 第 1/3 点）。"""
-    paths, _ = workspace
-    sources_file = paths.home / "sources.yaml"
-    sources_file.write_text(SOURCES_YAML, encoding="utf-8")
-    target = date(2026, 10, 19)
+def _feed_no_list_date():
+    """列表页不带日期：商务部 xwfb 一类栏目就是这样，靠详情页日期兜底。"""
+    return json.dumps([{"TITLE": "中共中央 国务院关于发展新质生产力的意见",
+                        "URL": ARTICLE_URL}], ensure_ascii=False)
 
-    default_run = run_pipeline(
-        Settings(), paths, target_date=target, sources_file=sources_file,
-        fetcher=_FrozenFetcher({
-            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
-            ARTICLE_URL: ARTICLE,
-        }), market_client=_MiniMarket())
-    assert default_run.window_start == "2026-10-18"
-    assert default_run.window_end == "2026-10-19"
-    assert default_run.docs == [], "10-09 发布的旧文不应混进缺省日报"
 
-    only_today = run_pipeline(
-        Settings(), paths, target_date=target, sources_file=sources_file,
-        fetcher=_FrozenFetcher({
-            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
-            ARTICLE_URL: ARTICLE,
-        }), market_client=_MiniMarket(), since_days=1)
-    assert only_today.window_start == "2026-10-19", "--since 1 即只收当日，不能落回 [昨日, 今日]"
-    assert only_today.docs == []
+def _fetch_with_feed(workspace, feed_json, window_start, window_end, article=ARTICLE):
+    paths, snapshot_dir = workspace
+    store = Store(paths.db)
+    fetcher = _FrozenFetcher({
+        "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": feed_json,
+        ARTICLE_URL: article,
+    })
+    diag: dict = {}
+    docs, failed, dupes = fetch_documents(fetcher, _specs(), Settings(), window_start,
+                                          window_end, snapshot_dir, "run-test", store, diag)
+    store.close()
+    return docs, failed, dupes, diag, fetcher
 
-    backfill = run_pipeline(
-        Settings(), paths, target_date=target, sources_file=sources_file,
-        fetcher=_FrozenFetcher({
-            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
-            ARTICLE_URL: ARTICLE,
-        }), market_client=_MiniMarket(), since_days=14)
-    assert backfill.window_start == "2026-10-06"
-    assert len(backfill.docs) == 1, "--since 14 显式补跑才收旧文"
+
+def test_detail_page_date_out_of_window_is_dropped(workspace):
+    """列表页无日期时，详情页日期必须再判一次窗口。
+
+    商务部 xwfb 列表页解析不出日期 → 旧实现绕过窗口过滤 → 10-14 的旧稿
+    进了「10-19 ~ 10-20」的当日日报。现在要剔除并计入 out_of_window_docs。
+    """
+    docs, failed, dupes, diag, fetcher = _fetch_with_feed(workspace, _feed_no_list_date(),
+                                                          "2026-10-19", "2026-10-20")
+    assert docs == [], f"详情页日期 2026-10-09 落在窗口外，不得入库：{docs}"
+    assert failed == [] and dupes == 0, "抓取本身成功，只是被窗口口径剔除"
+    assert diag["out_of_window_docs"] == 1, "窗口外的稿子必须计数，不能静默丢弃"
+    assert diag["no_update"] == ["gov_zhengce"], "全部候选都被剔除 = 该源窗口内无更新"
+    # 剔除明细必须逐条进告警：source_id + url + 提取日期 + 判定窗口，数字才能回溯
+    assert any("窗口外剔除" in w and ARTICLE_URL in w and "2026-10-09" in w
+               and "[2026-10-19, 2026-10-20]" in w for w in fetcher.warnings), \
+        f"窗口外剔除要有可回溯的逐条告警：{fetcher.warnings}"
+
+
+def test_detail_page_date_inside_window_is_kept(workspace):
+    """对照组：详情页日期在窗口内时照常入库，out_of_window_docs 归零。"""
+    docs, failed, dupes, diag, _ = _fetch_with_feed(workspace, _feed_no_list_date(),
+                                                    "2026-10-06", "2026-10-19")
+    assert len(docs) == 1, "详情页日期 2026-10-09 在窗口内，应当入库"
+    assert docs[0].published_at == "2026-10-09", "入库日期取详情页日期"
+    assert diag["out_of_window_docs"] == 0
+    assert diag["no_update"] == []
+    assert failed == [] and dupes == 0
+
+
+def _long_page_with_text_date(date_text: str) -> str:
+    """前 200KB 里没有日期、正文里有的页面：日期只能走文本兜底分支。
+
+    填充块用 <style>：extract_main_text 会剥掉它，正文仍然带日期；
+    extract_publish_time 的 html 分支只看 raw html[:200000]，看不到日期。
+    """
+    pad = "#pad{color:red;padding:1px;margin:2px}\n" * 7000  # ~224KB，日期必然落在 200KB 之后
+    sentence = ("会议于" + date_text + "举行，本次会议研究了低空经济产业协同与基础设施"
+                "建设相关工作，并就下一步重点任务作出部署安排。")
+    return (
+        "<html><head><title>测试会议通知</title>"
+        f"<style>{pad}</style></head><body>"
+        f"<article><h1>测试会议通知</h1><p>{sentence * 6}</p></article>"
+        "</body></html>"
+    )
+
+
+def test_text_fallback_date_in_window_is_not_dropped(workspace):
+    """文本兜底分支的日期必须归一后再判窗：窗口内稿件不得被未归一日期误杀。"""
+    docs, failed, dupes, diag, _ = _fetch_with_feed(
+        workspace, _feed_no_list_date(), "2026-10-19", "2026-10-20",
+        article=_long_page_with_text_date("2026年10月19日"))
+    assert len(docs) == 1, "窗口内稿件不得被文本分支的未归一日期误杀"
+    assert docs[0].published_at == "2026-10-19", "文本兜底分支也要归一成 YYYY-MM-DD"
+    assert diag["out_of_window_docs"] == 0, "误杀不能混进真剔除的计数"
+    assert diag["no_update"] == []
+    assert failed == [] and dupes == 0
+
+
+def test_text_fallback_date_out_of_window_is_still_dropped(workspace):
+    """对照组：文本兜底分支取到的窗口外日期照常剔除并计数。"""
+    docs, failed, dupes, diag, fetcher = _fetch_with_feed(
+        workspace, _feed_no_list_date(), "2026-10-19", "2026-10-20",
+        article=_long_page_with_text_date("2026年10月14日"))
+    assert docs == [], "文本分支取到的 2026-10-14 在窗口外，不得入库"
+    assert failed == [] and dupes == 0, "抓取本身成功，只是被窗口口径剔除"
+    assert diag["out_of_window_docs"] == 1, "归一后的窗口外日期照常计入真剔除"
+    assert diag["no_update"] == ["gov_zhengce"]
+    assert any("窗口外剔除" in w and "2026-10-14" in w for w in fetcher.warnings), \
+        "文本分支取到的窗口外日期同样要留下可回溯的告警明细"

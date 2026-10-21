@@ -11,6 +11,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCES_FILE = REPO_ROOT / "sources.yaml"
 DEFAULT_THEME_ALIAS = REPO_ROOT / "data" / "theme_alias.csv"
+# 主题 -> 公司业务关键词：相关性闸门拿它去和 F10 主营/营收构成比对
+DEFAULT_THEME_BUSINESS = REPO_ROOT / "data" / "theme_business.csv"
 
 DISCLAIMER = (
     "本报告由程序自动抓取公开会议与政策信息、由模型生成，仅用于个人研究，"
@@ -21,6 +23,16 @@ DISCLAIMER = (
 MAPPING_CAVEAT = (
     "概念板块成分由第三方（通达信）维护，宽口径，可能包含非核心主题个股；"
     "本表为政策主题映射结果，不代表个股基本面判断。"
+)
+
+# 当日增量口径下的“空日报”文案：没有新内容是常态，不是故障
+EMPTY_DAY_NOTICE = "今日无新增政策 / 事件"
+
+# 公司级相关性闸门口径说明，固定出现在日报概览下方
+GATE_CAVEAT = (
+    "个股先过「公司级相关性闸门」：用通达信 F10 的主营业务 / 营收构成 / 研究行业"
+    "与政策主题的业务关键词求交集，无实质交集的个股相关性被压到最低并不再进入正文；"
+    "闸门是过滤器，不是基本面判断。"
 )
 
 
@@ -78,9 +90,9 @@ class SourceSpec:
 
 @dataclass
 class Settings:
-    # 补跑窗口长度：仅显式 `--since N`（或 `--since` 不带 N）的补跑模式生效；
-    # 默认日报固定只收 [run_date-1d, run_date]，窗口内无新增就明确写「今日无新增政策/事件」
-    lookback_days: int = 14
+    # 日报默认只收当日增量：窗口 = [target-(daily_window_days-1), target]。
+    # 历史回补不再走默认路径，必须显式 `policypulse run --since N`。
+    daily_window_days: int = 2
     max_docs_per_source: int = 12
     min_confidence: float = 0.45
     min_strength_for_report: int = 3
@@ -94,20 +106,31 @@ class Settings:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36 PolicyPulse/0.1 (personal research)"
     )
-    # 打分权重（外置可调）
+    # 打分权重（外置可调）：公司级相关性主导，市值流动性只作并列决胜位
     weights: dict = field(
         default_factory=lambda: {
-            "strength": 0.35,
-            "relevance": 0.25,
-            "liquidity": 0.20,
-            "breadth": 0.10,
+            "strength": 0.25,
+            "relevance": 0.50,
+            "liquidity": 0.10,
+            "breadth": 0.05,
             "novelty": 0.10,
         }
     )
+    # 公司级相关性闸门
+    relevance_gate: bool = True
+    # drop=闸门不通过直接不进正文；demote=保留入库但相关性压到最低（默认，便于审计）
+    relevance_gate_mode: str = "demote"
+    # 全局相关性截断：低于该值的个股不进日报（取代“每板块 Top-N”）
+    min_relevance: float = 0.5
+    # 算力上界：单条信号最多展开多少只候选再过闸门（只影响评估量，不参与最终排序）
+    max_candidates_per_signal: int = 300
+    # 公司画像（F10）缓存 TTL：主营业务/营收构成变化以季度计，7 天足够
+    company_profile_ttl_hours: int = 168
+    # 深度研读：对全局 Top-K 个股产出结构化小报告（需 LLM，未配置则跳过并写明原因）
+    deepdive_top_k: int = 3
     # 过滤
     min_market_cap_yi: float = 30.0
     exclude_bj: bool = True
-    top_n_per_sector: int = 5
     max_tickers_per_signal: int = 10
     # tongstock
     tongstock_bin: str = "tongstock"
@@ -158,7 +181,8 @@ def load_theme_alias(path: Path = DEFAULT_THEME_ALIAS) -> dict[str, list[str]]:
     import csv
 
     mapping: dict[str, list[str]] = {}
-    with path.open(encoding="utf-8") as fh:
+    # utf-8-sig：theme_alias.csv 带 BOM，不剥掉会把首行注释变成一个假主题
+    with path.open(encoding="utf-8-sig") as fh:
         for row in csv.reader(fh):
             if not row or row[0].startswith("#"):
                 continue
@@ -167,4 +191,27 @@ def load_theme_alias(path: Path = DEFAULT_THEME_ALIAS) -> dict[str, list[str]]:
             mapping.setdefault(theme, []).extend(aliases)
     for theme, aliases in mapping.items():
         mapping[theme] = sorted(set(aliases + [theme]))
+    return mapping
+
+
+def load_theme_business(path: Path | None = None) -> dict[str, list[str]]:
+    """返回 canonical_theme -> [公司业务关键词...]，供相关性闸门比对主营业务/营收构成。
+
+    与 theme_alias 的区别：别名用于「政策主题 ↔ 板块名」，业务关键词用于
+    「政策主题 ↔ 公司主营业务」，因此刻意避开「消费」「装备」这类一抓一大把的泛词。
+    文件缺失时返回空表（闸门退化为只用别名，不阻塞运行）。
+    """
+    import csv
+
+    p = path or DEFAULT_THEME_BUSINESS
+    mapping: dict[str, list[str]] = {}
+    if not p.exists():
+        return mapping
+    with p.open(encoding="utf-8-sig") as fh:
+        for row in csv.reader(fh):
+            if not row or row[0].startswith("#"):
+                continue
+            theme = row[0].strip()
+            words = [w.strip() for w in (row[1].split("|") if len(row) > 1 else []) if w.strip()]
+            mapping.setdefault(theme, []).extend(words)
     return mapping
