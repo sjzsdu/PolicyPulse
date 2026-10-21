@@ -221,7 +221,9 @@ def render_markdown(result: RunResult) -> str:
             lines.append(f"- 影响判断：{d.impact}")
             if d.risks:
                 lines.append(f"- 风险提示：{'；'.join(d.risks)}")
-            lines.append(f"- 溯源：{'; '.join(f'{x['label']}（`{x['ref']}`）' for x in d.sources)}")
+            # 拼好再嵌入：嵌套同引号 f-string 是 PEP 701（仅 3.12+），3.10/3.11 直接 SyntaxError
+            src_lines = [f"{x['label']}（`{x['ref']}`）" for x in d.sources]
+            lines.append(f"- 溯源：{'; '.join(src_lines)}")
             lines.append("")
 
     lines.extend(_compliance_lines(result))

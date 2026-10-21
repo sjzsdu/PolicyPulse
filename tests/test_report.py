@@ -50,6 +50,26 @@ def test_markdown_lists_signal_traceability_fields():
         assert field in md
 
 
+def test_markdown_deepdive_sources_line_renders():
+    """深度研读的溯源行：渲染正确且不依赖 3.12+ 的嵌套同引号 f-string。"""
+    from policypulse.deepdive import DeepDive
+
+    r = _result()
+    r.deepdives = [DeepDive(
+        ticker_code="600001", ticker_name="测试A", policy_title="发展新质生产力",
+        policy_summary="加快培育低空经济", policy_quote="加快培育低空经济新增长极",
+        policy_url="https://www.gov.cn/a.htm", profile_business="航空装备制造",
+        transmission="政策直接利好", competition="龙头地位稳固", impact="订单增加",
+        risks=["落地不及预期"],
+        sources=[{"label": "政策原文", "ref": "https://www.gov.cn/a.htm"},
+                 {"label": "公司画像", "ref": "通达信F10:600001"}],
+    )]
+    md = render_markdown(r)
+    assert ("- 溯源：政策原文（`https://www.gov.cn/a.htm`）; "
+            "公司画像（`通达信F10:600001`）") in md
+    assert "风险提示：落地不及预期" in md
+
+
 def test_json_is_parseable_and_complete():
     import json
 
