@@ -91,6 +91,27 @@ def test_gate_without_profile_fails_open():
     assert relevance_after_gate(1.0, gate) == 1.0
 
 
+def test_gate_separates_unparsed_profile_from_missing_f10():
+    """F10 取到了文本但解析不出字段（站点改版）≠ 没取到 F10：成因分列、文案如实。
+
+    两者都放行（不能把「没数据/没解析」当成「不相关」），但报表里必须能看出是哪一种，
+    否则「无画像放行」会同时混入「取不到」和「解析失败」。
+    """
+    unparsed = CompanyProfile(code="830000", name="测试公司", fetched=True)
+    gate = evaluate_gate(["低空经济"], unparsed)
+    assert gate.passed and gate.basis == "unparsed_profile"
+    assert "未解析" in gate.evidence
+    assert "F10 未取到" not in gate.evidence, "数据在、只是没解析，不能写成未取到"
+    assert relevance_after_gate(1.0, gate) == 1.0, "放行不抬分，保持基线映射置信度"
+
+    missing = CompanyProfile(code="830001", fetched=False)
+    gate2 = evaluate_gate(["低空经济"], missing)
+    assert gate2.passed and gate2.basis == "no_profile"
+    assert "F10 未取到" in gate2.evidence
+
+    assert evaluate_gate(["低空经济"], None).basis == "no_profile"
+
+
 def test_gate_hit_raises_relevance_but_miss_caps_it():
     from policypulse.relevance import GateResult
 

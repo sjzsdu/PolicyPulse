@@ -156,6 +156,15 @@ def test_markdown_states_the_company_gate():
     assert "公司级相关性闸门" in md
 
 
+def test_markdown_labels_unparsed_profile_gate_rows():
+    """闸门统计里「F10 已取未解析」必须与「无画像」分两行标签显示。"""
+    r = _result()
+    r.stats["gate"] = {"no_profile": 1, "unparsed_profile": 2}
+    md = render_markdown(r)
+    assert "无画像放行 1" in md
+    assert "F10已取未解析放行 2" in md
+
+
 def _with_compliance(result: RunResult) -> RunResult:
     result.stats.update({
         "pbc_related_docs": 2,

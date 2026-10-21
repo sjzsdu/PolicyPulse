@@ -29,6 +29,9 @@ BASIS_HIT = "profile_hit"
 BASIS_WEAK_HIT = "weak_hit"
 BASIS_MISS = "profile_miss"
 BASIS_NO_PROFILE = "no_profile"
+# F10 文本取到了但一个字段都没解析出来（站点改版/格式异常）：数据在、只是没解析。
+# 与「取不到」分开记账，别把解析失败混进「无画像」放行里被放行掩盖
+BASIS_UNPARSED_PROFILE = "unparsed_profile"
 BASIS_DISABLED = "disabled"
 
 
@@ -70,10 +73,15 @@ def evaluate_gate(terms: list[str], profile: CompanyProfile | None) -> GateResul
       「乡村振兴帮扶」「技术培训」这类写法不构成业务实质相关），但记为弱命中，
       相关性压到 WEAK_CAP 而不是 DEMOTE_CAP，便于调 min_relevance 复核
     - 无交集 → 不通过，压到 DEMOTE_CAP
-    - 拿不到画像 → 放行并标注（不能把「没数据」当成「不相关」）
+    - 拿不到画像（F10 未取到）→ 放行并标注（不能把「没数据」当成「不相关」）
+    - F10 取到了文本但解析不出字段 → 同样放行，但单列 unparsed_profile，证据如实写
+      「已取到但未解析」，与「未取到」分开记账
     """
-    if profile is None or not profile.has_profile:
+    if profile is None or not profile.fetched:
         return GateResult(True, BASIS_NO_PROFILE, "无公司画像（F10 未取到），闸门放行并标注")
+    if not profile.has_profile:
+        return GateResult(True, BASIS_UNPARSED_PROFILE,
+                          "F10 文本已取到但未解析出业务字段（格式可能已改版），闸门放行并标注")
 
     strong = profile.strong_text()
     hits = tuple(t for t in terms if t in strong)

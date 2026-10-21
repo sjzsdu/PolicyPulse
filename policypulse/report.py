@@ -54,7 +54,8 @@ def _gate_line(gate: dict) -> str:
     if not gate:
         return "—"
     labels = {"profile_hit": "业务命中放行", "weak_hit": "经营范围弱命中",
-              "no_profile": "无画像放行", "profile_miss": "无实质交集",
+              "no_profile": "无画像放行", "unparsed_profile": "F10已取未解析放行",
+              "profile_miss": "无实质交集",
               "disabled": "闸门关闭", "dropped": "直接剔除"}
     parts = [f"{labels.get(k, k)} {v}" for k, v in gate.items() if v]
     return "、".join(parts) or "—"
