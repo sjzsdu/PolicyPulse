@@ -84,9 +84,9 @@ def render_markdown(result: RunResult) -> str:
     if result.duplicates_skipped:
         lines.append(f"- 另有 {result.duplicates_skipped} 篇文档正文指纹已在库（跨 run 去重），本次未重复抽取。")
         lines.append("")
-    if s.get("out_of_window_docs"):
-        lines.append(f"- 有 {s['out_of_window_docs']} 篇来自「栏目窗口内无更新」的兜底抓取，日期可能早于统计窗口，"
-                     "对应条目在下方标注 `窗口外兜底`。")
+    if not result.docs and not result.failed_sources:
+        lines.append(f"**今日无新增政策/事件。**统计窗口 {result.window_start} ~ {result.window_end} "
+                     "内没有新发布内容，不再回退抓取旧文凑数（历史内容用 `--since N` 显式补跑）。")
         lines.append("")
 
     bullish_all = [c for c in result.conclusions if c["direction"] == "利好" and c["tickers"]]
@@ -111,8 +111,7 @@ def render_markdown(result: RunResult) -> str:
         lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
         lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
         lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
-        fallback = " · `窗口外兜底`" if c.get("out_of_window_fallback") else ""
-        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}{fallback}")
+        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
         lines.append(f"- 原文：[{c['source_url']}]({c['source_url']})")
         lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
         lines.append("")
@@ -178,7 +177,6 @@ def render_html(result: RunResult) -> str:
     for c in result.conclusions:
         if c["direction"] != "利好" or not c["tickers"] or c["strength"] < min_strength:
             continue
-        fallback = " · 窗口外兜底" if c.get("out_of_window_fallback") else ""
         trows = "".join(
             f"<tr><td>{t['rank']}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
             f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
@@ -189,7 +187,7 @@ def render_html(result: RunResult) -> str:
         rows.append(
             f"<section><h3>{_esc(c['summary'])}</h3>"
             f"<p class='meta'>{_esc(c['org'])} · {_esc(c['meeting_type'])} · {_esc(c['published_at'])} · "
-            f"strength {c['strength']} · 置信度 {c['confidence']}{fallback}</p>"
+            f"strength {c['strength']} · 置信度 {c['confidence']}</p>"
             f"<blockquote>{_esc(c['quote'])}</blockquote>"
             f"<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
             f"<th>score</th><th>理由</th><th>溯源</th></tr></thead><tbody>{trows}</tbody></table></section>"

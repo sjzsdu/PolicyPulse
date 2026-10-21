@@ -11,7 +11,7 @@ def _result() -> RunResult:
     r.stats = {
         "docs": 3, "signals": 4, "with_tickers": 1, "ticker_rows": 2,
         "sources_total": 6, "sources_failed": 1, "tongstock_calls": 5, "llm_enabled": False,
-        "duplicates_skipped": 0, "out_of_window_docs": 0, "min_strength_for_report": 3,
+        "duplicates_skipped": 0, "min_strength_for_report": 3,
     }
     r.failed_sources = ["miit: timeout"]
     r.conclusions = [{
@@ -24,7 +24,7 @@ def _result() -> RunResult:
         "fetched_at": "2026-10-19T10:00:00+0800", "content_hash": "abc",
         "raw_snapshot_path": str(Path(__file__).resolve().parents[1] / "data" / "snapshots" / "r1" / "doc-1.html"),
         "model": "rules-v1", "prompt_version": "rules-v1",
-        "matched_sectors": ["低空经济"], "out_of_window_fallback": False,
+        "matched_sectors": ["低空经济"],
         "tickers": [{
             "ticker_code": "600001", "ticker_name": "测试A", "exchange": "sh", "board": "沪市主板",
             "market_cap": 500.0, "sector_name": "低空经济", "sector_source": "通达信概念",
@@ -93,13 +93,22 @@ def test_markdown_snapshot_path_is_relative(tmp_path):
     assert Path(payload["conclusions"][0]["raw_snapshot_path"]).is_absolute()
 
 
-def test_out_of_window_fallback_is_marked():
-    r = _result()
-    r.conclusions[0]["out_of_window_fallback"] = True
-    r.stats["out_of_window_docs"] = 1
+def test_empty_report_declares_no_new_items():
+    """空日报必须显式写「今日无新增政策/事件」，不再兜底抓旧文（WAN-11 第 1 点）。"""
+    r = RunResult(run_id="r2", window_start="2026-10-18", window_end="2026-10-19")
+    r.stats = {
+        "docs": 0, "signals": 0, "with_tickers": 0, "ticker_rows": 0,
+        "sources_total": 1, "sources_failed": 0, "tongstock_calls": 0, "llm_enabled": False,
+        "duplicates_skipped": 0, "min_strength_for_report": 3,
+    }
     md = render_markdown(r)
-    assert "窗口外兜底" in md
-    assert "来自「栏目窗口内无更新」的兜底抓取" in md
+    assert "今日无新增政策/事件" in md
+    assert "不再回退抓取旧文" in md
+    assert "窗口外兜底" not in md, "兜底口径已删除，产物里不应再出现"
+
+    payload = json.loads(render_json(r))
+    assert payload["window"]["start"] == "2026-10-18"
+    assert payload["conclusions"] == []
 
 
 def _with_compliance(result: RunResult) -> RunResult:

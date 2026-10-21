@@ -78,7 +78,8 @@ class SourceSpec:
 
 @dataclass
 class Settings:
-    # 默认看 14 天：部委栏目推送节奏慢于日更，窗口太窄会经常空转
+    # 补跑窗口长度：仅显式 `--since N`（或 `--since` 不带 N）的补跑模式生效；
+    # 默认日报固定只收 [run_date-1d, run_date]，窗口内无新增就明确写「今日无新增政策/事件」
     lookback_days: int = 14
     max_docs_per_source: int = 12
     min_confidence: float = 0.45

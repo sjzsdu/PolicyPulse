@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from policypulse import llm
@@ -28,7 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="抓取→抽取→映射→打分→出日报")
     p_run.add_argument("--date", help="目标日期 YYYY-MM-DD，默认今天")
-    p_run.add_argument("--lookback-days", type=int, default=None, help="统计窗口天数")
+    p_run.add_argument("--since", nargs="?", const=0, default=None, type=int, metavar="N",
+                       help="显式补跑：收最近 N 天（省略 N 则用配置 lookback_days）；"
+                            "不带此参数时日报固定只收 [昨日, 今日]")
     p_run.add_argument("--sources", nargs="*", default=None, help="只跑指定 source id")
     p_run.add_argument("--sources-file", type=Path, default=None)
     p_run.add_argument("--refresh-market", action="store_true", help="强制刷新 tongstock 板块/个股缓存")
@@ -50,17 +52,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_run(args) -> int:
     settings = load_settings()
-    if args.lookback_days:
-        settings.lookback_days = args.lookback_days
     if args.no_dedupe:
         settings.cross_run_dedupe = False
     paths = default_paths()
 
     target = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-    print(f"[policypulse] run window = {target} (lookback {settings.lookback_days}d)", flush=True)
+    # lookback_days 只在显式 --since 补跑时生效；默认日报恒为 [target-1, target]
+    since_days = args.since
+    if since_days == 0:
+        since_days = settings.lookback_days
+    if since_days:
+        print(f"[policypulse] 补跑模式 --since {since_days}d，窗口拉长到最近 {since_days} 天", flush=True)
+    else:
+        print(f"[policypulse] 默认窗口 = [{target - timedelta(days=1)}, {target}]"
+              f"（只收窗口内发布，不再回退抓旧文）", flush=True)
 
     result = run_pipeline(settings, paths, target_date=target, sources_file=args.sources_file,
-                          refresh_market=args.refresh_market, only_sources=args.sources)
+                          refresh_market=args.refresh_market, only_sources=args.sources,
+                          since_days=since_days)
 
     print(f"[policypulse] docs={result.stats['docs']} signals={result.stats['signals']} "
           f"ticker_rows={result.stats['ticker_rows']} "
@@ -78,7 +87,10 @@ def cmd_run(args) -> int:
         print(f"[policypulse] json   -> {written['json']}", flush=True)
         print(f"[policypulse] html   -> {written['html']}", flush=True)
     if not result.conclusions:
-        print("[policypulse] 本轮没有产出结论（可能是窗口内无更新或源不可达）", flush=True)
+        if not result.docs and not result.failed_sources:
+            print("[policypulse] 今日无新增政策/事件", flush=True)
+            return 0
+        print("[policypulse] 本轮没有产出结论（可能是源不可达）", flush=True)
         return 1
     return 0
 

@@ -1,4 +1,6 @@
 # 可选：不想用默认值时改这里。缺省时 policypulse 用 Settings 的内置默认值。
+# lookback_days 仅在显式 --since 补跑（--since 不带 N）时作为默认补跑天数；
+# 默认日报固定只收 [昨日, 今日]，窗口内无新增就写「今日无新增政策/事件」。
 lookback_days: 14
 max_docs_per_source: 12
 min_confidence: 0.45
