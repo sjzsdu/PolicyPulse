@@ -208,6 +208,15 @@ def test_default_window_is_yesterday_and_today__since_only_for_backfill(workspac
     assert default_run.window_end == "2026-10-19"
     assert default_run.docs == [], "10-09 发布的旧文不应混进缺省日报"
 
+    only_today = run_pipeline(
+        Settings(), paths, target_date=target, sources_file=sources_file,
+        fetcher=_FrozenFetcher({
+            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
+            ARTICLE_URL: ARTICLE,
+        }), market_client=_MiniMarket(), since_days=1)
+    assert only_today.window_start == "2026-10-19", "--since 1 即只收当日，不能落回 [昨日, 今日]"
+    assert only_today.docs == []
+
     backfill = run_pipeline(
         Settings(), paths, target_date=target, sources_file=sources_file,
         fetcher=_FrozenFetcher({

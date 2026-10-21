@@ -29,8 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="抓取→抽取→映射→打分→出日报")
     p_run.add_argument("--date", help="目标日期 YYYY-MM-DD，默认今天")
     p_run.add_argument("--since", nargs="?", const=0, default=None, type=int, metavar="N",
-                       help="显式补跑：收最近 N 天（省略 N 则用配置 lookback_days）；"
-                            "不带此参数时日报固定只收 [昨日, 今日]")
+                       help="显式补跑：收最近 N 天（--since 1 即只收当日；省略 N 则用配置 "
+                            "lookback_days）；不带此参数时日报固定只收 [昨日, 今日]")
     p_run.add_argument("--sources", nargs="*", default=None, help="只跑指定 source id")
     p_run.add_argument("--sources-file", type=Path, default=None)
     p_run.add_argument("--refresh-market", action="store_true", help="强制刷新 tongstock 板块/个股缓存")

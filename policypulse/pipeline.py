@@ -376,8 +376,9 @@ def run(settings: Settings, paths, target_date: date | None = None,
         only_sources: list[str] | None = None, fetcher: Fetcher | None = None,
         market_client=None, since_days: int | None = None) -> RunResult:
     target = target_date or date.today()
-    # 默认日报只收 [昨日, 今日]（容忍晚间/次日见报）；--since N 显式补跑才拉长窗口
-    if since_days and since_days > 1:
+    # 默认日报只收 [昨日, 今日]（容忍晚间/次日见报）；--since N 显式补跑才拉长窗口，
+    # --since 1 即只收当日
+    if since_days and since_days >= 1:
         window_start = (target - timedelta(days=since_days - 1)).isoformat()
     else:
         window_start = (target - timedelta(days=1)).isoformat()

@@ -106,6 +106,10 @@ def test_empty_report_declares_no_new_items():
     assert "不再回退抓取旧文" in md
     assert "窗口外兜底" not in md, "兜底口径已删除，产物里不应再出现"
 
+    out = render_html(r)
+    assert "今日无新增政策/事件" in out, "空日报的 HTML 也必须有声明，与 Markdown 对齐"
+    assert "窗口外兜底" not in out
+
     payload = json.loads(render_json(r))
     assert payload["window"]["start"] == "2026-10-18"
     assert payload["conclusions"] == []

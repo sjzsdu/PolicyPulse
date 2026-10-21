@@ -206,6 +206,12 @@ def render_html(result: RunResult) -> str:
             "<th>robots 判定</th><th>判定依据</th><th>本轮文档</th></tr></thead>"
             f"<tbody>{cells}</tbody></table>")
 
+    empty_day = ""
+    if not result.docs and not result.failed_sources:
+        empty_day = (f"<p class='caveat'>今日无新增政策/事件。统计窗口 {_esc(result.window_start)} ~ "
+                     f"{_esc(result.window_end)} 内没有新发布内容，不再回退抓取旧文凑数"
+                     "（历史内容用 --since N 显式补跑）。</p>")
+
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PolicyPulse 日报 {_esc(result.window_end)}</title>
 <style>
@@ -223,6 +229,7 @@ th{{background:#f5f5f5}}
 <p class="disc">{_esc(DISCLAIMER)}</p>
 <p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
 <p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
+{empty_day}
 {''.join(rows) or '<p>本轮没有命中「利好且有板块映射」的信号。</p>'}
 {compliance}
 <p class="disc">{_esc(DISCLAIMER)}</p>
