@@ -111,6 +111,28 @@ inbound/pbc_inbound/2026-10-19-公开市场业务交易公告.url   # 一行：�
 policypulse run --sources pbc_inbound
 ```
 
+「另存为 + 手抄 URL」这一步可以用 `tools/capture_pbc_inbound.py` 省掉：它驱动
+**ego-browser 的一次人工会话**（真实 Chromium + 真实 profile，你本人可见、可随时接管），
+把页面 HTML 与 `page.url()` 直接写进 `inbound/pbc_inbound/`，文件名里的日期取页面发布时间：
+
+```bash
+# URL 由你从央行栏目页肉眼选定后粘过来；工具不做链接发现、不翻页
+python3 tools/capture_pbc_inbound.py --url 'https://www.pbc.gov.cn/…/index.html'
+python3 tools/capture_pbc_inbound.py --url '<URL1>' --url '<URL2>' --dry-run   # 先看脚本
+```
+
+它**不发 HTTP 请求**：请求由浏览器在你的会话里发出，等价于你手动另存；管线对
+pbc.gov.cn 依旧零请求。三条硬约束写死在工具里——只取命令行给出的 URL、不伪造 UA/不挂代理、
+遇验证码/登录墙 `handOff()` 交还控制权。**不要把它放进定时任务**：无人在场就不该跑，
+那就成爬虫了。
+
+2026-10-19 的一次真实会话（本节数字即该次产物）：从
+`goutongjiaoliu/113456/113469/index.html`（新闻发布栏目）选了两篇公开稿入库——
+《关于金融支持建设北京（京津冀）、上海（长三角）、粤港澳大湾区国际科技创新中心的指导意见》、
+《2026年前三季度金融统计数据报告》；随后 `policypulse run` 的 **35 篇 / 87 条信号 /
+480 行个股结论**里，央行相关文档 8 篇（`mof_czxw` 2 + `xinhua_pbc` 4 + `pbc_inbound` 2），
+`policypulse verify` 为 **33 一致 + 2 一致（本地原件）**，链接失效 0。
+
 溯源 URL 的三个来源（按优先级）：同名 `.url` 伴生文件 → 正文前 5 行的
 `原文: https://…` / `来源链接: …` 标记 → HTML 的 `<link rel="canonical">` / `<base href>`。
 **三者都没有的文件会被拒收并在告警区点名**——没有 URL 就没有 `source_url`，结论不可回溯，
