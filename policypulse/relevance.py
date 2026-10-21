@@ -40,6 +40,14 @@ class GateResult:
     hits: tuple[str, ...] = ()
 
 
+def _hits_evidence(prefix: str, hits: tuple[str, ...]) -> str:
+    """证据串列全命中词（截断到 3 个），审计时能看到公司凭什么被判相关。"""
+    shown = "、".join(hits[:3])
+    if len(hits) > 3:
+        shown += f" 等 {len(hits)} 个关键词"
+    return f"{prefix}「{shown}」"
+
+
 def theme_terms(theme: str, alias_map: dict[str, list[str]] | None = None,
                 business_map: dict[str, list[str]] | None = None) -> list[str]:
     """一个政策主题用于比对公司业务的关键词集合，按长度降序（长词优先命中）。"""
@@ -49,7 +57,9 @@ def theme_terms(theme: str, alias_map: dict[str, list[str]] | None = None,
     raw.extend(alias_map.get(theme, []))
     raw.extend(business_map.get(theme, []))
     terms = {t.strip() for t in raw if t and len(t.strip()) >= MIN_TERM_LEN}
-    return sorted(terms, key=len, reverse=True)
+    # 同长度关键词按字典序定序：命中顺序必须与 PYTHONHASHSEED 无关，
+    # 否则 evidence 里出现哪个词会随进程哈希种子漂移（闸门判定本身不受影响）
+    return sorted(terms, key=lambda t: (-len(t), t))
 
 
 def evaluate_gate(terms: list[str], profile: CompanyProfile | None) -> GateResult:
@@ -68,13 +78,14 @@ def evaluate_gate(terms: list[str], profile: CompanyProfile | None) -> GateResul
     strong = profile.strong_text()
     hits = tuple(t for t in terms if t in strong)
     if hits:
-        return GateResult(True, BASIS_HIT, f"主营业务/营收构成命中「{hits[0]}」", hits)
+        return GateResult(True, BASIS_HIT, _hits_evidence("主营业务/营收构成命中", hits), hits)
 
     weak = profile.weak_text()
     weak_hits = tuple(t for t in terms if len(t) >= MIN_WEAK_TERM_LEN and t in weak)
     if weak_hits:
         return GateResult(False, BASIS_WEAK_HIT,
-                          f"仅经营范围命中「{weak_hits[0]}」（弱证据，不足以证明业务实质相关）",
+                          _hits_evidence("仅经营范围命中", weak_hits)
+                          + "（弱证据，不足以证明业务实质相关）",
                           weak_hits)
 
     return GateResult(False, BASIS_MISS, "主营业务/营收构成与主题无实质交集")
