@@ -234,8 +234,17 @@ pytest -m tongstock             # 校验本机 tongstock 数据可用
 ## 每天自动跑
 
 ```cron
+PATH=/Users/you/.local/bin:/usr/local/bin:/usr/bin:/bin
 30 8 * * * cd /path/to/PolicyPulse && . .venv/bin/activate && policypulse run >> logs/run.log 2>&1
 ```
+
+cron 的默认 PATH 只有 `/usr/bin:/bin`，`~/.local/bin` 不在里面，`tongstock`
+会报 `not found on PATH`——把本机 `command -v tongstock` 的真实路径写进上面第一行
+（crontab 环境行对整表生效），路径写死，不要用 `~`（cron 里不展开）。
+
+不动 crontab 的话，也可以把 tongstock 二进制绝对路径写进 `policypulse.yaml`：
+`tongstock_bin: /Users/you/.local/bin/tongstock`，`TongstockClient` 优先用这个路径，
+不依赖运行环境的 PATH。
 
 ## 已知边界（MVP 有意不做）
 
