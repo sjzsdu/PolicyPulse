@@ -44,8 +44,6 @@ class DocRecord:
     snapshot_path: str
     body: str
     duplicate_of: str = ""
-    # H：窗口内该栏目无更新时，退回去抓入口页最近几条，产物里要能看到
-    out_of_window_fallback: bool = False
 
 
 @dataclass
@@ -168,13 +166,8 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
             picked.append(item)
             if len(picked) >= settings.max_docs_per_source:
                 break
-        fallback_used = False
-        if not picked and items:
-            # 该栏目在窗口内没有更新：抓入口页最近几条，保证链路有真实素材
-            picked = items[: min(3, settings.max_docs_per_source)]
-            fallback_used = True
-            for item in picked:
-                fetcher.configure_rate_limit(item.url, spec.rate_limit_seconds)
+        # 窗口内（含无日期兜过）没有可收条目就跳过该源：不回退抓旧文凑数，
+        # 空日报由报告显式写「今日无新增政策/事件」，历史内容只走 --since 补跑
 
         for item in picked:
             try:
@@ -227,7 +220,6 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                 raw_hash=raw_digest,
                 snapshot_path=str(snap),
                 body=body,
-                out_of_window_fallback=fallback_used,
             ))
     _emit_warnings(fetcher, warnings)
     return docs, failed, duplicates_skipped
@@ -335,7 +327,6 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
                 "model": sig.model,
                 "prompt_version": sig.prompt_version,
                 "matched_sectors": [m.sector_name for m in matches],
-                "out_of_window_fallback": doc.out_of_window_fallback,
                 "tickers": tickers,
             })
     return all_signals, conclusions
@@ -383,9 +374,14 @@ def _signals_from_llm(doc, store: Store, settings: Settings):
 def run(settings: Settings, paths, target_date: date | None = None,
         sources_file: Path | None = None, refresh_market: bool = False,
         only_sources: list[str] | None = None, fetcher: Fetcher | None = None,
-        market_client=None) -> RunResult:
+        market_client=None, since_days: int | None = None) -> RunResult:
     target = target_date or date.today()
-    window_start = (target - timedelta(days=settings.lookback_days - 1)).isoformat()
+    # 默认日报只收 [昨日, 今日]（容忍晚间/次日见报）；--since N 显式补跑才拉长窗口，
+    # --since 1 即只收当日
+    if since_days and since_days >= 1:
+        window_start = (target - timedelta(days=since_days - 1)).isoformat()
+    else:
+        window_start = (target - timedelta(days=1)).isoformat()
     window_end = target.isoformat()
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
@@ -451,7 +447,6 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "local_inbound_sources": len(specs) - len(net_source_ids),
         "fetch_failures": len(failed),
         "duplicates_skipped": duplicates,
-        "out_of_window_docs": sum(1 for d in docs if d.out_of_window_fallback),
         # 央行相关内容条数与来源：WAN-10 的验收要能指认
         "pbc_related_docs": sum(1 for d in docs if is_pbc_related(d.title, d.body)),
         "pbc_related_sources": sorted({d.source_id for d in docs if is_pbc_related(d.title, d.body)}),

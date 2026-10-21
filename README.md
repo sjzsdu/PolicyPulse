@@ -25,7 +25,7 @@ policypulse selftest          # 先确认 tongstock / 网络 / LLM 三件事的�
 policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出日报
 ```
 
-常用开关：`--date`、`--lookback-days N`、`--sources <id...>`、`--refresh-market`、
+常用开关：`--date`、`--since N`（显式补跑最近 N 天）、`--sources <id...>`、`--refresh-market`、
 `--no-dedupe`（当天重跑时关掉跨 run 去重）。
 
 跑完的产物：
@@ -46,7 +46,7 @@ policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出�
 policypulse sources                    # 列出信息源清单
 policypulse show <signal_id>           # 打印一个信号的完整溯源链
 policypulse verify --run <run_id>      # 重抓原文核对：一致 / 内容已变 / 链接失效
-policypulse run --date 2026-10-09 --lookback-days 7
+policypulse run --date 2026-10-09 --since 7
 policypulse run --sources gov_zhengce xinhua_pbc pbc_inbound
 ```
 
@@ -187,12 +187,14 @@ sources.yaml 入口页
   两套 TLS 栈的 CA / 代理配置不同，同一台机器上可能一个通一个不通，会让档位静默翻转。
 - 只抓公开页面，不绕登录 / 验证码 / 付费墙。
 
-### 去重与兜底
+### 窗口与去重
 
+- 默认日报固定只收 `[run_date-1d, run_date]`（容忍晚间/次日见报），实际窗口写在概览「统计窗口」。
+- 窗口内没有新发布时**不再回退抓旧文凑数**：日报显式写「今日无新增政策/事件」。要重看历史，
+  用 `policypulse run --since N` 显式补跑（省略 N 则用配置 `lookback_days`）；不带 `--since` 的
+  普通日报恒为两日窗口，补跑模式只在显式传入时生效。
 - 单次 run 内按正文 `content_hash` 去重；**跨 run 也去重**（指纹已在库则不再重复抽取），
   当天要重跑用 `--no-dedupe`。被跳过的条数写在日报概览里。
-- 某栏目在统计窗口内无更新时，会退回去抓入口页最近几条以保证链路有素材；
-  这些文档在产物里标注 `窗口外兜底`，概览里也有条数，不会静默混进当天结论。
 
 ### 映射口径
 
@@ -254,8 +256,17 @@ pytest -m tongstock             # 校验本机 tongstock 数据可用
 ## 每天自动跑
 
 ```cron
+PATH=/Users/you/.local/bin:/usr/local/bin:/usr/bin:/bin
 30 8 * * * cd /path/to/PolicyPulse && . .venv/bin/activate && policypulse run >> logs/run.log 2>&1
 ```
+
+cron 的默认 PATH 只有 `/usr/bin:/bin`，`~/.local/bin` 不在里面，`tongstock`
+会报 `not found on PATH`——把本机 `command -v tongstock` 的真实路径写进上面第一行
+（crontab 环境行对整表生效），路径写死，不要用 `~`（cron 里不展开）。
+
+不动 crontab 的话，也可以把 tongstock 二进制绝对路径写进 `policypulse.yaml`：
+`tongstock_bin: /Users/you/.local/bin/tongstock`，`TongstockClient` 优先用这个路径，
+不依赖运行环境的 PATH。
 
 ## 已知边界（MVP 有意不做）
 
