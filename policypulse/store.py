@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS signals (
   summary TEXT, quote TEXT, direction TEXT, strength INTEGER, horizon TEXT,
   novelty TEXT, instruments TEXT, theme_tags TEXT, affected_regions TEXT,
   affected_sectors_hint TEXT, confidence REAL, quote_verified INTEGER,
-  model TEXT, prompt_version TEXT, extracted_at TEXT
+  model TEXT, prompt_version TEXT, extracted_at TEXT,
+  investable INTEGER, investable_reason TEXT
 );
 CREATE TABLE IF NOT EXISTS sectors (
   sector_name TEXT, sector_source TEXT, member_count INTEGER,
@@ -113,6 +114,12 @@ class Store:
                 if col == "relevance":
                     self.conn.execute("UPDATE signal_ticker SET relevance=mapping_confidence"
                                       " WHERE relevance IS NULL")
+        # 信号级可投资性闸门：老库里的历史信号不回填判定结果（NULL = 未评估），
+        # 展示层按当前词表实时判定，避免把历史行硬标成某一侧
+        sig_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(signals)")}
+        for col, decl in (("investable", "INTEGER"), ("investable_reason", "TEXT")):
+            if col not in sig_columns:
+                self.conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {decl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -174,10 +181,12 @@ class Store:
             c.execute(
                 "INSERT INTO signals(signal_id, doc_id, run_id, summary, quote, direction, strength,"
                 " horizon, novelty, instruments, theme_tags, affected_regions, affected_sectors_hint,"
-                " confidence, quote_verified, model, prompt_version, extracted_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " confidence, quote_verified, model, prompt_version, extracted_at,"
+                " investable, investable_reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(signal_id) DO UPDATE SET summary=excluded.summary, quote=excluded.quote,"
-                " direction=excluded.direction, strength=excluded.strength, confidence=excluded.confidence",
+                " direction=excluded.direction, strength=excluded.strength, confidence=excluded.confidence,"
+                " investable=excluded.investable, investable_reason=excluded.investable_reason",
                 (
                     sig.signal_id, sig.doc_id, run_id, sig.summary, sig.quote, sig.direction,
                     sig.strength, sig.horizon, sig.novelty, json.dumps(sig.instruments, ensure_ascii=False),
@@ -185,6 +194,8 @@ class Store:
                     json.dumps(sig.affected_regions, ensure_ascii=False),
                     json.dumps(sig.affected_sectors_hint, ensure_ascii=False),
                     sig.confidence, int(sig.quote_verified), sig.model, sig.prompt_version, now(),
+                    int(getattr(sig, "investable", False)),
+                    getattr(sig, "investable_reason", ""),
                 ),
             )
 
@@ -244,6 +255,16 @@ class Store:
             "SELECT st.*, t.name, t.exchange, t.board, t.market_cap_yi FROM signal_ticker st"
             " LEFT JOIN tickers t ON t.code=st.code WHERE st.signal_id=? ORDER BY st.rank",
             (signal_id,)))
+
+    def clear_signal_tickers(self, signal_id: str) -> int:
+        """删掉一条信号的个股展开行。
+
+        信号被判非投资后，历史 run 留下的展开行必须一起清掉：只跳过本次展开
+        等于「字段加了、表里还在」，重跑后受益表与 show 仍会显示旧个股。
+        """
+        cur = self.conn.execute("DELETE FROM signal_ticker WHERE signal_id=?", (signal_id,))
+        self.conn.commit()
+        return cur.rowcount
 
     def log_llm_call(self, signal_id: str, model: str, prompt_version: str,
                      prompt: str, raw: str) -> None:

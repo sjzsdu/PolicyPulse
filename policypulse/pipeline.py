@@ -24,6 +24,7 @@ from policypulse.config import (
 from policypulse.deepdive import DeepDive, build_deepdives
 from policypulse.extract import classify_meeting_type, extract_signals, verify_quote
 from policypulse.http import FetchError, Fetcher, content_hash
+from policypulse.investability import assess_signal
 from policypulse.mapping import build_candidates, match_sectors
 from policypulse.scoring import SCORE_VERSION, rank, why_of
 from policypulse.sources.registry import get_adapter
@@ -320,8 +321,17 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
             signals = extract_signals(doc.doc_id, doc.title, doc.body, alias_map, settings)
 
         for sig in signals:
+            # 信号级可投资性闸门：确定性词表判定，在板块匹配与个股展开之前。
+            # 非投资信号仍入库（可审计），但不映射板块、不展开个股，
+            # 并清掉历史 run 遗留的展开行——否则「受益」表里还留着旧个股
+            sig.investable, sig.investable_reason = assess_signal(sig, settings, business_map)
             store.upsert_signal(sig, run_id)
             all_signals.append(sig)
+
+            if not sig.investable:
+                store.clear_signal_tickers(sig.signal_id)
+                conclusions.append(_skeleton_conclusion(sig, doc))
+                continue
 
             matches = match_sectors(sig.theme_tags, concept_sectors, industry_sectors, alias_map)
             candidates = build_candidates(matches, client, settings, alias_map,
@@ -385,10 +395,49 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
                 "raw_snapshot_path": doc.snapshot_path,
                 "model": sig.model,
                 "prompt_version": sig.prompt_version,
+                "investable": sig.investable,
+                "investable_reason": sig.investable_reason,
                 "matched_sectors": [m.sector_name for m in matches],
                 "tickers": tickers,
             })
     return all_signals, conclusions
+
+
+def _skeleton_conclusion(sig, doc) -> dict:
+    """非投资信号的结论行：完整溯源 + 判定依据，但没有板块映射与个股展开。
+
+    仍要产出 conclusion，否则日报的「非投资信号」区无从展示，库里也查不到判定了什么。
+    """
+    return {
+        "signal_id": sig.signal_id,
+        "doc_id": doc.doc_id,
+        "doc_title": doc.title,
+        "summary": sig.summary,
+        "direction": sig.direction,
+        "strength": sig.strength,
+        "horizon": sig.horizon,
+        "novelty": sig.novelty,
+        "instruments": sig.instruments,
+        "theme_tags": sig.theme_tags,
+        "confidence": sig.confidence,
+        "quote": sig.quote,
+        "quote_verified": sig.quote_verified,
+        "source_url": doc.url,
+        "publisher": doc.org,
+        "org": doc.org,
+        "meeting_type": doc.meeting_type,
+        "published_at": doc.published_at,
+        "fetched_at": doc.fetched_at,
+        "content_hash": doc.content_hash,
+        "raw_hash": doc.raw_hash,
+        "raw_snapshot_path": doc.snapshot_path,
+        "model": sig.model,
+        "prompt_version": sig.prompt_version,
+        "investable": sig.investable,
+        "investable_reason": sig.investable_reason,
+        "matched_sectors": [],
+        "tickers": [],
+    }
 
 
 def _file_of(sector_source: str) -> str:
@@ -504,6 +553,7 @@ def run(settings: Settings, paths, target_date: date | None = None,
     warnings.extend(deepdive_notes)
 
     ticker_count = sum(len(e["tickers"]) for e in conclusions)
+    non_investable = [c for c in conclusions if not c.get("investable", True)]
     store.finish_run(run_id, "ok", len(docs), len(signals), ticker_count,
                      notes="; ".join(failed)[:500])
 
@@ -523,6 +573,10 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "signals": len(signals),
         "with_tickers": sum(1 for c in conclusions if c["tickers"]),
         "ticker_rows": ticker_count,
+        # 信号级可投资性闸门：非投资信号 = 泛经济样板表述，只留审计行
+        "investable_gate": settings.investable_gate,
+        "non_investable_signals": len(non_investable),
+        "non_investable_signal_ids": [c["signal_id"] for c in non_investable],
         "events": len(events),
         "event_conclusions": sum(len(e.conclusions) for e in events),
         "window_start": window_start,

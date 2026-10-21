@@ -11,8 +11,27 @@ import json
 from pathlib import Path
 
 from policypulse.clustering import _ensure_events, merge_tickers
-from policypulse.config import DISCLAIMER, EMPTY_DAY_NOTICE, GATE_CAVEAT, MAPPING_CAVEAT, REPO_ROOT
+from policypulse.config import (
+    DISCLAIMER,
+    EMPTY_DAY_NOTICE,
+    GATE_CAVEAT,
+    INVESTABLE_CAVEAT,
+    MAPPING_CAVEAT,
+    REPO_ROOT,
+)
+from policypulse.deepdive import substantive_transmission
 from policypulse.pipeline import RunResult
+
+# 报告分区：受益个股 > 仅概念关联 > 非投资信号。
+# 「概念关联（未做实质传导判定）」是受益区里的标注——没有 LLM 深读时保持现有行为
+# （个股表照常呈现），但不再自称「受益」，避免把未判定包装成结论。
+SECTION_BULLISH = "受益个股"
+SECTION_CONCEPT_PENDING = "概念关联（未做实质传导判定）"
+SECTION_CONCEPT_ONLY = "仅概念关联"
+SECTION_NON_INVESTABLE = "非投资信号"
+
+# 受益区里的事件必须落在前两个分区里；仅概念关联与非投资信号各自单独成节
+MAIN_SECTIONS = (SECTION_BULLISH, SECTION_CONCEPT_PENDING)
 
 
 def _esc(text) -> str:
@@ -50,6 +69,97 @@ def _is_bullish(c: dict, min_strength: int) -> bool:
     return c["direction"] == "利好" and c["strength"] >= min_strength and c["tickers"]
 
 
+def _verdicts_by_event(deepdives) -> dict[str, list[bool]]:
+    """event_id -> 该事件各条深读的传导判定（True=实质，False=无实质）。"""
+    out: dict[str, list[bool]] = {}
+    for d in deepdives or []:
+        verdict = substantive_transmission(getattr(d, "transmission", ""))
+        if verdict is None or not getattr(d, "event_id", ""):
+            continue
+        out.setdefault(d.event_id, []).append(verdict)
+    return out
+
+
+def _event_section(ev, verdicts_by_event: dict[str, list[bool]]) -> str:
+    """深读结论反向决定事件分区。
+
+    - 没有可投资信号 → 非投资信号（改动 1，词表闸门已判定）
+    - 有深读且全部/多数判「无实质传导」→ 仅概念关联（改动 2，不再授予受益头衔）
+    - 有深读且多数判实质传导 → 受益个股
+    - 没有深读（未配 LLM）→ 保持现有行为仍进受益区，但明确标注未做传导判定
+    """
+    if not [c for c in ev.conclusions if c.get("investable", True)]:
+        return SECTION_NON_INVESTABLE
+    verdicts = verdicts_by_event.get(ev.event_id) or []
+    if verdicts:
+        no_substance = sum(1 for v in verdicts if not v)
+        if no_substance * 2 > len(verdicts):
+            return SECTION_CONCEPT_ONLY
+        return SECTION_BULLISH
+    return SECTION_CONCEPT_PENDING
+
+
+def _qualifying(ev, min_strength: int) -> list[dict]:
+    return [c for c in ev.conclusions if _is_bullish(c, min_strength)]
+
+
+def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: int,
+                  section: str, index: int) -> None:
+    rows = merge_tickers(qualifying)
+    doc_count = len(ev.doc_ids)
+    lines.append(f"### {index}. {ev.title}")
+    lines.append("")
+    lines.append(f"- 事件ID：`{ev.event_id}`（合并 {doc_count} 篇文档）")
+    lines.append(f"- 分区：{section}")
+    lines.append(f"- 来源：{ev.org or '—'} · {ev.meeting_type or '—'} · "
+                 f"{ev.published_at or '日期未知'}")
+    lines.append(f"- 原文：[{ev.source_url}]({ev.source_url})")
+    lines.append(f"- 快照：`{relative_snapshot(ev.snapshot_path)}`")
+    lines.append(f"- 事件内信号 {len(ev.conclusions)} 条，其中力度 ≥ {min_strength} 且有映射 "
+                 f"{len(qualifying)} 条")
+    lines.append("")
+    for c in qualifying:
+        lines.append(f"#### `{c['signal_id']}` {c['summary']}")
+        lines.append("")
+        lines.append(f"- 信号ID：`{c['signal_id']}`")
+        lines.append(f"- 力度/周期/性质：strength **{c['strength']}** / {c['horizon']} / {c['novelty']}")
+        lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
+        lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
+        lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
+        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
+        lines.append(f"- 原文：{_source_links(c)}")
+        lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
+        lines.append("")
+        lines.append(f"> {c['quote']}")
+        lines.append("")
+    lines.append("| # | 代码 | 名称 | 板块 | 市值(亿) | score | 相关性 | 受益理由 | 映射路径 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    for i, t in enumerate(rows, start=1):
+        rel = t.get("relevance", t.get("mapping_confidence", 0))
+        lines.append(
+            f"| {i} | {t['ticker_code']} | {t['ticker_name']} | "
+            f"{t['sector_name']}({t['sector_source']}) | {t['market_cap']:.1f} | {t['score']} | "
+            f"{rel} | {t['why']} | {t['mapping_path']} |"
+        )
+    lines.append("")
+
+
+def _non_investable_lines(conclusions: list[dict]) -> list[str]:
+    """非投资信号区：一行一条，带判定依据与原文链接，方便逐条复核词表判定。"""
+    rows = [c for c in conclusions if not c.get("investable", True)]
+    if not rows:
+        return []
+    lines = ["## 非投资信号（泛经济样板表述，不映射板块、不展开个股）", "",
+             "| 信号ID | 摘要 | 判定依据 | 原文 |",
+             "|---|---|---|---|"]
+    for c in rows:
+        reason = c.get("investable_reason", "") or "—"
+        lines.append(f"| `{c['signal_id']}` | {c['summary'][:40]} | {reason} | "
+                     f"[{c['org']}]({c['source_url']}) |")
+    lines.append("")
+    return lines
+
+
 def _gate_line(gate: dict) -> str:
     if not gate:
         return "—"
@@ -85,6 +195,10 @@ def render_markdown(result: RunResult) -> str:
     lines.append(f"| 政策事件（聚类后） | {s.get('events', len(events))} |")
     lines.append(f"| 抽取信号 | {s['signals']} |")
     lines.append(f"| 有映射个股的信号 | {s['with_tickers']} |")
+    non_inv = s.get("non_investable_signals", 0)
+    gate_off = not s.get("investable_gate", True)
+    lines.append(f"| 信号级可投资性闸门 | "
+                 f"{'关闭（全部按可投资处理）' if gate_off else f'非投资信号 {non_inv} 条'} |")
     lines.append(f"| 个股结论行数（事件内去重后） | {s['ticker_rows']} |")
     lines.append(f"| 信息源（可用/总数） | {s.get('sources_ok', 0)} / {s['sources_total']} |")
     lines.append(f"| 抓取失败条目 | {s.get('fetch_failures', 0)} |")
@@ -100,6 +214,8 @@ def render_markdown(result: RunResult) -> str:
                  f"{'（来源：' + '、'.join(pbc_src) + '）' if pbc_src else ''} |")
     lines.append("")
     lines.append(f"> 口径说明：{MAPPING_CAVEAT}")
+    lines.append("")
+    lines.append(f"> {INVESTABLE_CAVEAT}")
     lines.append("")
     lines.append(f"> {GATE_CAVEAT}")
     lines.append("")
@@ -146,7 +262,15 @@ def render_markdown(result: RunResult) -> str:
     filtered_out = len(bullish_all) - len(bullish)
     bullish.sort(key=lambda c: (-c["strength"], -c["confidence"]))
 
-    lines.append("## 政策事件与候选个股")
+    deepdives = list(getattr(result, "deepdives", None) or [])
+    verdicts = _verdicts_by_event(deepdives)
+    sections = {ev.event_id: _event_section(ev, verdicts) for ev in events}
+    main_events = [ev for ev in events
+                   if sections[ev.event_id] in MAIN_SECTIONS and _qualifying(ev, min_strength)]
+    concept_events = [ev for ev in events
+                      if sections[ev.event_id] == SECTION_CONCEPT_ONLY and _qualifying(ev, min_strength)]
+
+    lines.append("## 受益个股")
     lines.append("")
     if filtered_out:
         lines.append(f"另有 {filtered_out} 条利好结论力度 < {min_strength}，未列入本表，详见同名 JSON 与数据库。")
@@ -154,52 +278,26 @@ def render_markdown(result: RunResult) -> str:
     if not bullish:
         lines.append(f"本轮没有命中「利好、有板块映射且力度 ≥ {min_strength}」的信号。")
         lines.append("")
+    if not main_events:
+        lines.append("**今日无实质投资信号**：没有「可投资且未被深读判为无实质传导」的政策事件。"
+                     "下面是仅概念关联与非投资信号留痕。")
+        lines.append("")
+    for i, ev in enumerate(main_events, start=1):
+        _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
+                      sections[ev.event_id], i)
 
-    shown = 0
-    for ev in events:
-        qualifying = [c for c in ev.conclusions if _is_bullish(c, min_strength)]
-        if not qualifying:
-            continue
-        shown += 1
-        rows = merge_tickers(qualifying)
-        doc_count = len(ev.doc_ids)
-        lines.append(f"### {shown}. {ev.title}")
+    if concept_events:
+        lines.append("## 仅概念关联（深读判定无实质传导，不授予受益头衔）")
         lines.append("")
-        lines.append(f"- 事件ID：`{ev.event_id}`（合并 {doc_count} 篇文档）")
-        lines.append(f"- 来源：{ev.org or '—'} · {ev.meeting_type or '—'} · "
-                     f"{ev.published_at or '日期未知'}")
-        lines.append(f"- 原文：[{ev.source_url}]({ev.source_url})")
-        lines.append(f"- 快照：`{relative_snapshot(ev.snapshot_path)}`")
-        lines.append(f"- 事件内信号 {len(ev.conclusions)} 条，其中力度 ≥ {min_strength} 且有映射 "
-                     f"{len(qualifying)} 条")
-        lines.append("")
-        for c in qualifying:
-            lines.append(f"#### `{c['signal_id']}` {c['summary']}")
-            lines.append("")
-            lines.append(f"- 信号ID：`{c['signal_id']}`")
-            lines.append(f"- 力度/周期/性质：strength **{c['strength']}** / {c['horizon']} / {c['novelty']}")
-            lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
-            lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
-            lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
-            lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
-            lines.append(f"- 原文：{_source_links(c)}")
-            lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
-            lines.append("")
-            lines.append(f"> {c['quote']}")
-            lines.append("")
-        lines.append("| # | 代码 | 名称 | 板块 | 市值(亿) | score | 相关性 | 受益理由 | 映射路径 |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
-        for i, t in enumerate(rows, start=1):
-            rel = t.get("relevance", t.get("mapping_confidence", 0))
-            lines.append(
-                f"| {i} | {t['ticker_code']} | {t['ticker_name']} | "
-                f"{t['sector_name']}({t['sector_source']}) | {t['market_cap']:.1f} | {t['score']} | "
-                f"{rel} | {t['why']} | {t['mapping_path']} |"
-            )
-        lines.append("")
+        for i, ev in enumerate(concept_events, start=1):
+            _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
+                          sections[ev.event_id], i)
+
+    lines.extend(_non_investable_lines(result.conclusions))
 
     bullish_ids = {c["signal_id"] for c in bullish}
-    others = [c for c in result.conclusions if c["signal_id"] not in bullish_ids]
+    others = [c for c in result.conclusions
+              if c["signal_id"] not in bullish_ids and c.get("investable", True)]
     if others:
         lines.append("## 其余信号（中性/利空/力度不足/无映射）")
         lines.append("")
@@ -210,7 +308,6 @@ def render_markdown(result: RunResult) -> str:
                          f"{c['summary'][:40]} | [{c['org']}]({c['source_url']}) |")
         lines.append("")
 
-    deepdives = list(getattr(result, "deepdives", None) or [])
     if deepdives:
         lines.append("## 个股深度研读（每条结论均带溯源）")
         lines.append("")
@@ -243,6 +340,10 @@ def render_markdown(result: RunResult) -> str:
 
 
 def render_json(result: RunResult) -> str:
+    deepdives = list(getattr(result, "deepdives", None) or [])
+    verdicts = _verdicts_by_event(deepdives)
+    events = _ensure_events(result)
+    sections = {ev.event_id: _event_section(ev, verdicts) for ev in events}
     payload = {
         "run_id": result.run_id,
         "window": {"start": result.window_start, "end": result.window_end},
@@ -257,59 +358,119 @@ def render_json(result: RunResult) -> str:
                 "source_url": e.source_url, "doc_ids": e.doc_ids,
                 "signal_ids": [c["signal_id"] for c in e.conclusions],
                 "tickers": e.tickers,
+                # 反向分区：json 与 md/html 三端一致
+                "investable": bool([c for c in e.conclusions if c.get("investable", True)]),
+                "section": sections[e.event_id],
+                "transmission_verdicts": verdicts.get(e.event_id, []),
             }
-            for e in _ensure_events(result)
+            for e in events
         ],
+        "sections": {
+            "受益个股": [e.event_id for e in events
+                       if sections[e.event_id] == SECTION_BULLISH],
+            "概念关联（未做实质传导判定）": [e.event_id for e in events
+                                       if sections[e.event_id] == SECTION_CONCEPT_PENDING],
+            "仅概念关联": [e.event_id for e in events
+                        if sections[e.event_id] == SECTION_CONCEPT_ONLY],
+            "非投资信号": [c["signal_id"] for c in result.conclusions
+                        if not c.get("investable", True)],
+        },
         "deepdives": [
             {
                 "ticker_code": d.ticker_code, "ticker_name": d.ticker_name,
                 "policy_title": d.policy_title, "transmission": d.transmission,
                 "competition": d.competition, "impact": d.impact,
                 "risks": d.risks, "sources": d.sources,
+                "event_id": getattr(d, "event_id", ""),
             }
-            for d in (getattr(result, "deepdives", None) or [])
+            for d in deepdives
         ],
         "disclaimer": DISCLAIMER,
         "mapping_caveat": MAPPING_CAVEAT,
+        "investable_caveat": INVESTABLE_CAVEAT,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _event_html(ev, verdicts_by_event: dict[str, list[bool]], min_strength: int) -> str:
+    """单个事件的 HTML 段：与 md 的 _render_event 同一套分区与筛选口径。"""
+    section = _event_section(ev, verdicts_by_event)
+    qualifying = _qualifying(ev, min_strength)
+    table_rows = merge_tickers(qualifying)
+    trows = "".join(
+        f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
+        f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
+        f"<td>{t.get('relevance', t.get('mapping_confidence', 0))}</td>"
+        f"<td>{_esc(t['why'])}</td>"
+        f"<td><a href='{_esc(ev.source_url)}' target='_blank'>原文</a></td></tr>"
+        for i, t in enumerate(table_rows, start=1)
+    )
+    sigs = "".join(
+        f"<h4><code>{_esc(c['signal_id'])}</code> {_esc(c['summary'])}</h4>"
+        f"<p class='meta'>strength {c['strength']} · 置信度 {c['confidence']} · "
+        f"引用校验 {'通过' if c['quote_verified'] else '未通过'} · {_esc(c['org'])} · "
+        f"{_esc(c['published_at'])}</p>"
+        f"<blockquote>{_esc(c['quote'])}</blockquote>"
+        for c in qualifying
+    )
+    return (
+        f"<section><h3>{_esc(ev.title)}</h3>"
+        f"<p class='meta'>事件ID <code>{_esc(ev.event_id)}</code> · 分区：{_esc(section)} · "
+        f"{_esc(ev.org)} · {_esc(ev.meeting_type)} · "
+        f"{_esc(ev.published_at)} · 合并 {len(ev.doc_ids)} 篇文档 · 信号 {len(ev.conclusions)} 条</p>"
+        f"{sigs}"
+        f"<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
+        f"<th>score</th><th>相关性</th><th>理由</th><th>溯源</th></tr></thead>"
+        f"<tbody>{trows}</tbody></table></section>"
+    )
+
+
+def _non_investable_html(conclusions: list[dict]) -> str:
+    """非投资信号区（HTML）：与 md 同名分区同一批信号、同一判定依据。"""
+    rows = [c for c in conclusions if not c.get("investable", True)]
+    if not rows:
+        return ""
+    cells = "".join(
+        f"<tr><td><code>{_esc(c['signal_id'])}</code></td><td>{_esc(c['summary'][:40])}</td>"
+        f"<td>{_esc(c.get('investable_reason', '') or '—')}</td>"
+        f"<td><a href='{_esc(c['source_url'])}' target='_blank'>{_esc(c['org'])}</a></td></tr>"
+        for c in rows
+    )
+    return (
+        "<h2>非投资信号（泛经济样板表述，不映射板块、不展开个股）</h2>"
+        "<table><thead><tr><th>信号ID</th><th>摘要</th><th>判定依据</th><th>原文</th></tr></thead>"
+        f"<tbody>{cells}</tbody></table>"
+    )
+
+
+def _sections_html(result, events, min_strength: int) -> str:
+    """HTML 的四个分区，与 md / json 使用同一套 _event_section 判定。"""
+    deepdives = list(getattr(result, "deepdives", None) or [])
+    verdicts = _verdicts_by_event(deepdives)
+    sections = {ev.event_id: _event_section(ev, verdicts) for ev in events}
+    main_events = [ev for ev in events
+                   if sections[ev.event_id] in MAIN_SECTIONS and _qualifying(ev, min_strength)]
+    concept_events = [ev for ev in events
+                      if sections[ev.event_id] == SECTION_CONCEPT_ONLY and _qualifying(ev, min_strength)]
+
+    parts = ["<h2>受益个股</h2>"]
+    if main_events:
+        parts.extend(_event_html(ev, verdicts, min_strength) for ev in main_events)
+    else:
+        parts.append("<p><strong>今日无实质投资信号</strong>：没有「可投资且未被深读判为无实质传导」"
+                     "的政策事件。下面是仅概念关联与非投资信号留痕。</p>")
+    if concept_events:
+        parts.append("<h2>仅概念关联（深读判定无实质传导，不授予受益头衔）</h2>")
+        parts.extend(_event_html(ev, verdicts, min_strength) for ev in concept_events)
+    parts.append(_non_investable_html(result.conclusions))
+    return "".join(parts)
 
 
 def render_html(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
     events = _ensure_events(result)
-    rows: list[str] = []
-    for ev in events:
-        qualifying = [c for c in ev.conclusions if _is_bullish(c, min_strength)]
-        if not qualifying:
-            continue
-        table_rows = merge_tickers(qualifying)
-        trows = "".join(
-            f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
-            f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
-            f"<td>{t.get('relevance', t.get('mapping_confidence', 0))}</td>"
-            f"<td>{_esc(t['why'])}</td>"
-            f"<td><a href='{_esc(ev.source_url)}' target='_blank'>原文</a></td></tr>"
-            for i, t in enumerate(table_rows, start=1)
-        )
-        sigs = "".join(
-            f"<h4><code>{_esc(c['signal_id'])}</code> {_esc(c['summary'])}</h4>"
-            f"<p class='meta'>strength {c['strength']} · 置信度 {c['confidence']} · "
-            f"引用校验 {'通过' if c['quote_verified'] else '未通过'} · {_esc(c['org'])} · "
-            f"{_esc(c['published_at'])}</p>"
-            f"<blockquote>{_esc(c['quote'])}</blockquote>"
-            for c in qualifying
-        )
-        rows.append(
-            f"<section><h3>{_esc(ev.title)}</h3>"
-            f"<p class='meta'>{_esc(ev.org)} · {_esc(ev.meeting_type)} · {_esc(ev.published_at)} · "
-            f"合并 {len(ev.doc_ids)} 篇文档 · 信号 {len(ev.conclusions)} 条</p>"
-            f"{sigs}"
-            f"<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
-            f"<th>score</th><th>相关性</th><th>理由</th><th>溯源</th></tr></thead>"
-            f"<tbody>{trows}</tbody></table></section>"
-        )
+    non_investable = [c for c in result.conclusions if not c.get("investable", True)]
 
     compliance = ""
     rows_detail = s.get("sources_detail") or []
@@ -324,16 +485,19 @@ def render_html(result: RunResult) -> str:
             "<th>robots 判定</th><th>判定依据</th><th>本轮文档</th></tr></thead>"
             f"<tbody>{cells}</tbody></table>")
 
-    body = "".join(rows) or f"<p>{_esc(EMPTY_DAY_NOTICE)}</p>"
-    if not result.conclusions and s["docs"] == 0:
-        body = (f"<p><strong>{_esc(EMPTY_DAY_NOTICE)}</strong>（窗口 "
-                f"{_esc(result.window_start)} ~ {_esc(result.window_end)}）</p>")
+    if not result.conclusions:
+        body = f"<p>{_esc(EMPTY_DAY_NOTICE)}</p>"
+        if s["docs"] == 0:
+            body = (f"<p><strong>{_esc(EMPTY_DAY_NOTICE)}</strong>（窗口 "
+                    f"{_esc(result.window_start)} ~ {_esc(result.window_end)}）</p>")
+    else:
+        body = _sections_html(result, events, min_strength)
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PolicyPulse 日报 {_esc(result.window_end)}</title>
 <style>
 body{{font-family:-apple-system,"PingFang SC",Helvetica,Arial,sans-serif;margin:32px auto;max-width:1080px;color:#1b1b1b;line-height:1.6}}
-h1{{font-size:24px}} h3{{font-size:18px;margin-bottom:4px}} h4{{font-size:15px;margin-bottom:2px}}
+h1{{font-size:24px}} h2{{font-size:20px;margin-top:26px}} h3{{font-size:18px;margin-bottom:4px}} h4{{font-size:15px;margin-bottom:2px}}
 .meta{{color:#666;font-size:13px;margin-top:0}}
 blockquote{{border-left:3px solid #c9a227;margin:8px 0;padding:8px 12px;background:#fbf8ef;color:#333}}
 table{{border-collapse:collapse;width:100%;margin:8px 0 20px;font-size:14px}}
@@ -345,8 +509,9 @@ th{{background:#f5f5f5}}
 <h1>PolicyPulse 日报 {_esc(result.window_end)}</h1>
 <p class="disc">{_esc(DISCLAIMER)}</p>
 <p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
+<p class="caveat">{_esc(INVESTABLE_CAVEAT)}</p>
 <p class="caveat">{_esc(GATE_CAVEAT)}</p>
-<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 事件 {s.get('events', len(events))} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
+<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 事件 {s.get('events', len(events))} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 非投资信号 {len(non_investable)} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
 {body}
 {compliance}
 <p class="disc">{_esc(DISCLAIMER)}</p>

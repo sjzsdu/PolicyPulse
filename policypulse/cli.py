@@ -16,6 +16,7 @@ from pathlib import Path
 
 from policypulse import llm
 from policypulse.config import EMPTY_DAY_NOTICE, default_paths, load_settings, load_sources
+from policypulse.investability import assess_text
 from policypulse.pipeline import run as run_pipeline
 from policypulse.report import write_reports
 from policypulse.store import Store
@@ -109,6 +110,14 @@ def cmd_show(args) -> int:
     print(f"摘要: {sig['summary']}")
     print(f"引用: {sig['quote']}  [子串校验: {'通过' if sig['quote_verified'] else '未通过'}]")
     print(f"主题: {sig['theme_tags']}  工具: {sig['instruments']}  周期: {sig['horizon']}  性质: {sig['novelty']}")
+    # 信号级可投资性闸门：历史行不回填，展示层按当前词表实时判定，可复核词表口径
+    ok, reason = assess_text(f"{sig['summary']}{sig['quote']}", load_settings())
+    print(f"可投资性: {'是' if ok else '否'} —— {reason}")
+    stored = sig["investable"]
+    if stored is None:
+        print("库内标记: 未评估（老库历史行不回填，重跑该 run 后写入）")
+    else:
+        print(f"库内标记: {'是' if stored else '否'} —— {sig['investable_reason'] or '—'}")
     if doc is not None:
         print(f"来源: {doc['org']} · {doc['meeting_type']} · {doc['published_at']}")
         print(f"URL : {doc['url']}")
@@ -116,7 +125,11 @@ def cmd_show(args) -> int:
         print(f"hash: {doc['content_hash']}  fetched_at={doc['fetched_at']}")
     print(f"模型: {sig['model']} / prompt {sig['prompt_version']}")
     if tickers:
-        print("个股:")
+        if not ok:
+            print(f"个股: 以下 {len(tickers)} 行是历史展开，信号级闸门判非投资后不进「受益」表"
+                  f"（重跑会清空这些行）:")
+        else:
+            print("个股:")
         for t in tickers:
             print(f"  {t['rank']}. {t['code']} {t['name']} · {t['sector_name']}({t['sector_source']}) · "
                   f"市值 {t['market_cap_yi']:.1f}亿 · score {t['score']}")
