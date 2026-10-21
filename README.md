@@ -14,8 +14,9 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-不要 `pip install .`（非 editable）。`sources.yaml` 与 `data/theme_alias.csv` 是随仓库走的
-数据文件，`config.py` 按仓库根定位它们，打进 wheel 的非 editable 安装会找不到。
+不要 `pip install .`（非 editable）。`sources.yaml`、`data/theme_alias.csv` 与
+`data/theme_business.csv` 是随仓库走的数据文件，`config.py` 按仓库根定位它们，
+打进 wheel 的非 editable 安装会找不到。
 package-data 方案未采用——这个选择是明确的，不是两可。
 
 ## 一条命令跑通
@@ -25,8 +26,15 @@ policypulse selftest          # 先确认 tongstock / 网络 / LLM 三件事的�
 policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出日报
 ```
 
-常用开关：`--date`、`--since N`（显式补跑最近 N 天）、`--sources <id...>`、`--refresh-market`、
-`--no-dedupe`（当天重跑时关掉跨 run 去重）。
+常用开关：`--date`、`--since N`（只在**显式补跑**时用）、`--sources <id...>`、
+`--refresh-market`、`--no-dedupe`（当天重跑时关掉跨 run 去重）。
+
+**日报只收当日增量**（本 issue 第 1 点）：默认窗口是 `[目标日-1, 目标日]`
+（`daily_window_days: 2`，容忍晚间与次日凌晨发布的稿子），只收 `published_at` 落在
+窗口内的稿件；**没有「窗口内无更新就回退抓最近几条」的兜底**，窗口内确实没有新稿时，
+日报就写「今日无新增政策 / 事件」——空日报是常态，不是故障。历史回补必须显式
+`policypulse run --since N`（窗口 `[目标日-N, 目标日]`），它的产物同样是按日期落盘的
+独立日报，不会混进当天那份。概览里写明本次真实统计窗口。
 
 跑完的产物：
 
@@ -38,7 +46,7 @@ policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出�
 - `data/snapshots/<run_id>/*` — 原文快照（不入库，后缀跟随原件）
 - `inbound/<source_id>/` — 人工下载的原文（目录骨架入库，用户放进去的文件不入库）
 
-`reports/2026-10-19.md` 是本机真实跑出来的一份，可以直接打开看效果。
+`reports/2026-10-20.md` 是本机真实跑出来的一份，可以直接打开看效果。
 
 其它命令：
 
@@ -104,8 +112,8 @@ robots 四档判定会把任何针对该 host 的请求挡在前面。
 ```bash
 # 1) 浏览器打开央行栏目，另存为（完整网页 或 只存文本都行）
 # 2) 放进这个目录，文件名带日期，并给一个溯源 URL
-inbound/pbc_inbound/2026-10-19-公开市场业务交易公告.html
-inbound/pbc_inbound/2026-10-19-公开市场业务交易公告.url   # 一行：原文 URL
+inbound/pbc_inbound/2026-10-20-公开市场业务交易公告.html
+inbound/pbc_inbound/2026-10-20-公开市场业务交易公告.url   # 一行：原文 URL
 
 # 3) 照常跑
 policypulse run --sources pbc_inbound
@@ -143,6 +151,9 @@ pbc.gov.cn 依旧零请求。三条硬约束写死在工具里——只取命令
 - 文件**不删不移**，跨 run 去重靠正文指纹，重复跑同一批不会重复抽取。
 - `published_at` 优先取文件名里的 `YYYY-MM-DD`，其次正文里的日期；都取不到就留空
   显示「日期未知」，**不拿文件 mtime 冒充发布日期**。
+- 入库文件同样受当日窗口约束：**能取到日期**且落在 `[目标日-1, 目标日]` 之外的，
+  当天不进日报（要看就 `policypulse run --since N --sources pbc_inbound` 补跑）；
+  取不到日期的按上一条显示「日期未知」并正常入库。
 - 目录空着不是故障，只在告警区提示；成功率统计不把本地源算进分母。
 - `policypulse verify` 对这类文档**不去重抓源站**（源站禁止抓取），改为与落盘的本地
   原件复算指纹，状态显示「一致（本地原件）」。
@@ -165,8 +176,12 @@ sources.yaml 入口页
     local_inbound：本地目录，不发网络请求）
   → 抓详情页，落原文快照 + 正文指纹去重
   → 规则抽取政策信号（无 LLM key 时默认路径；有 key 自动切 LLM，同一套校验兜底）
+  → 按窗口筛 published_at（[目标日-1, 目标日]；--since N 才回补更早）
   → 主题归一（data/theme_alias.csv）→ 板块匹配（精确/别名/包含/模糊≥0.8）
-  → 板块成分股展开 → 过滤（ST、市值<30亿、北交所）→ 打分排序 → 落库 → 出日报
+  → 板块成分股展开 → 过滤（ST、市值<30亿、北交所）
+  → 公司级相关性闸门（data/theme_business.csv × F10 主营/营收构成）
+  → 信号聚成政策事件 → 打分排序（相关性主导）→ 全局 min_relevance 截断
+  → Top-K 个股深度研读（需 LLM，无 key 跳过）→ 落库 → 出日报
 ```
 
 ### 抓取合规
@@ -187,14 +202,14 @@ sources.yaml 入口页
   两套 TLS 栈的 CA / 代理配置不同，同一台机器上可能一个通一个不通，会让档位静默翻转。
 - 只抓公开页面，不绕登录 / 验证码 / 付费墙。
 
-### 窗口与去重
+### 去重与当日口径
 
-- 默认日报固定只收 `[run_date-1d, run_date]`（容忍晚间/次日见报），实际窗口写在概览「统计窗口」。
-- 窗口内没有新发布时**不再回退抓旧文凑数**：日报显式写「今日无新增政策/事件」。要重看历史，
-  用 `policypulse run --since N` 显式补跑（省略 N 则用配置 `lookback_days`）；不带 `--since` 的
-  普通日报恒为两日窗口，补跑模式只在显式传入时生效。
 - 单次 run 内按正文 `content_hash` 去重；**跨 run 也去重**（指纹已在库则不再重复抽取），
   当天要重跑用 `--no-dedupe`。被跳过的条数写在日报概览里。
+- **不再有「窗口内无更新就退回抓入口页最近几条」的兜底**（旧 `lookback_days: 14`
+  就是「今日日报里混进 10-09 / 10-14 旧文」的根因）。窗口内没有新稿就是没有新稿：
+  日报写「今日无新增政策 / 事件」，告警区不报错，CLI 退出码 0（抓取失败才非 0，
+  好让 cron 看得见真故障）。
 
 ### 映射口径
 
@@ -211,13 +226,59 @@ sources.yaml 入口页
 
 ### 日报口径
 
+**统计窗口**：`[目标日-1, 目标日]`（`daily_window_days: 2`）；`--since N` 时为
+`[目标日-N, 目标日]`。窗口由 `published_at` 决定，概览第一行写明实际窗口。窗口外的稿子
+既不抓也不入库进当天结论——这是「今日日报只收当日增量」的实现边界。
+
 Markdown 正文只收「利好 + 有板块映射 + `strength >= min_strength_for_report`」（默认 3）；
 被力度门槛滤掉的条数写在概览里，完整结论在同日 JSON 与数据库中，不静默丢。
 
-### 打分
+### 打分（score-v2）
 
-`score = 0.35×力度 + 0.25×主题匹配度 + 0.20×市值档位 + 0.10×板块受益面 + 0.10×政策性质`
-权重集中在 `policypulse.yaml`（不存在则用 `Settings` 默认值）。只输出相对排序与理由。
+`score = 0.25×力度 + 0.50×公司级相关性 + 0.10×市值流动性 + 0.05×板块受益面 + 0.10×政策性质`
+
+权重集中在 `policypulse.yaml`（不存在则用 `Settings` 默认值）。变化点：**公司级相关性
+成为主导项**，市值流动性从 0.20 降到 0.10 且只作并列决胜位；**去掉了「每板块 Top-N
+（默认 5）」硬上限**，改为全局按 `min_relevance` 截断——排序是真正的从高到低，
+不再是「先按板块分组、组内按市值排」。
+
+### 公司级相关性闸门（`policypulse/relevance.py` + `profile.py`）
+
+老口径的「相关性」其实是**板块名命中**：「职业教育」能映射出大中矿业、永辉超市，
+「新零售」会出现五粮液、京东方——它们只是通达信板块成员，跟政策没有业务交集。
+闸门换成**公司业务命中**：
+
+- `profile.py` 取通达信 F10 的「公司概况 + 主营构成」，解析出主营业务 / 经营范围 /
+  研究行业 / 营收构成段，按 `company_profile_ttl_hours`（默认 7 天）缓存到 `data/cache/`。
+- `relevance.py` 拿 `data/theme_business.csv` 里该主题的业务关键词去比对：
+  主营业务 / 营收构成 / 研究行业命中 → **强命中**，放行并抬分（`+0.15`）；
+  只有经营范围命中（关键词 ≥3 字，因为经营范围满是「技术培训」这类样板词）→
+  **弱命中**，不放行，相关性压到 `0.45`；无交集 → 压到 `0.25`；拿不到画像 →
+  放行并标注 `no_profile`（不能把「没数据」当成「不相关」）。
+- 低于 `min_relevance`（默认 0.5）的个股不进日报正文，但**仍入库**（`gate_basis` /
+  `gate_evidence` 两列），便于事后审计为什么被过滤。`relevance_gate_mode: drop`
+  则直接不产出。
+- 闸门是纯规则，**无 LLM key 也照常工作**；证据串列出全部命中关键词，可点回 F10 原文。
+- `data/theme_business.csv` 与 `theme_alias.csv` 分工：别名管「主题 ↔ 板块名」，
+  业务关键词管「主题 ↔ 公司主营」，后者刻意避开「消费」「装备」这类泛词。
+  新增主题时两张表都要补，`tests/test_gate.py` 会检查覆盖。
+
+### 政策事件聚类（`policypulse/clustering.py`）
+
+同一文档 / 同一场发布会抽出的多条信号在报告里是重复的（旧产物里 68 条信号有成对
+重复、个股表完全一样）。聚类按 `doc_id`（同文档）与 `title+org+published_at` 的
+近邻（同发布会）归成一个「政策事件」，个股结论**按事件汇总去重**：同一股票在同事件下
+只保留分最高那条。事件编号 `E{n}` 出现在报告里，信号层仍全部落库，不丢信息。
+
+### 个股深度研读（`policypulse/deepdive.py`）
+
+对全局 Top-K（`deepdive_top_k`，默认 3）个股产出结构化小报告：主营业务与相关营收占比、
+政策传导路径（直接 / 间接 / 中性）、竞争地位、实施风险、个股特有风险。**需要 LLM**：
+
+- 未配置 LLM → 整段跳过，日报里写明跳过原因，不阻塞其它环节（本 issue 边界 2）；
+- **溯源红线**：模型返回的每条 `sources.ref` 只认三类白名单——该政策的 `source_url`、
+  `通达信F10:<code>`、原文快照路径；出现其它 ref 或必填字段缺失 → 整段作废不产出。
+  `llm_fn` 参数化，规则路径做不出带溯源的深度结论，宁可空着也不编。
 
 ## 没有 LLM key 也能跑
 
@@ -255,9 +316,17 @@ pytest -m tongstock             # 校验本机 tongstock 数据可用
 
 ## 每天自动跑
 
+**cron 的 PATH 坑（实测踩过）**：cron 环境的 `PATH` 通常是
+`/usr/bin:/bin`，**不含 `~/.local/bin`**，于是 `tongstock` 找不到，
+`policypulse run` 直接失败——手动在 shell 里能跑通不代表 cron 能跑通。两种修法任选：
+
+1. crontab 顶部加 `PATH=` 环境行（推荐，见下例；**环境行对整表生效**）；
+2. 或在 `policypulse.yaml` 里写绝对路径：`tongstock_bin: /Users/you/.local/bin/tongstock`
+   （`selftest` 用的就是同一配置，先跑 `policypulse selftest` 确认）。
+
 ```cron
-PATH=/Users/you/.local/bin:/usr/local/bin:/usr/bin:/bin
-30 8 * * * cd /path/to/PolicyPulse && . .venv/bin/activate && policypulse run >> logs/run.log 2>&1
+PATH=/Users/you/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+30 8 * * * cd /path/to/PolicyPulse && . .venv/bin/activate && mkdir -p logs && policypulse run >> logs/run.log 2>&1
 ```
 
 cron 的默认 PATH 只有 `/usr/bin:/bin`，`~/.local/bin` 不在里面，`tongstock`
@@ -268,6 +337,13 @@ cron 的默认 PATH 只有 `/usr/bin:/bin`，`~/.local/bin` 不在里面，`tong
 `tongstock_bin: /Users/you/.local/bin/tongstock`，`TongstockClient` 优先用这个路径，
 不依赖运行环境的 PATH。
 
+注意两件事：
+
+- 退出码：窗口内**没有新稿也是 0**，只有「抓取失败导致无产出」才是 1，
+  所以 cron 的失败告警对应的是真故障，不是空日报；
+- 日报按 `--date`（默认今天）落 `reports/YYYY-MM-DD.md`，同一天重跑会覆盖同名文件，
+  跨 run 去重默认开着，重跑不会重复产出信号。
+
 ## 已知边界（MVP 有意不做）
 
 - 源覆盖面：联网源 6 个（国务院×2 + 发改委/财政部/商务部 + 新华网财经转载），
@@ -277,5 +353,9 @@ cron 的默认 PATH 只有 `/usr/bin:/bin`，`~/.local/bin` 不在里面，`tong
   「新华网转载 + 人工入库」两条合规路径，详见上文专节。
 - 「利率市场化 / 公开市场操作」一类无产业主题词的央行稿子进得来、可 `verify`，
   但映射不到板块，不会出现在个股排序表里。
-- 概念板块映射天然偏大市值（板块内按市值取 Top-N），个股层面不做基本面判断。
+- 概念板块成员仍由第三方（通达信）宽口径维护，但个股要先过**公司级相关性闸门**才进正文；
+  闸门靠 F10 文本关键词，是过滤器不是基本面判断，`no_profile` 时会放行（宁可漏杀不误杀）。
+- 个股深度研读需要 LLM，无 key 时整段缺席；规则路径不伪造深度结论。
+- 当日口径下日报明显变稀、空日报是常态——扩高频源（新华财经、政府要闻等日更栏目）
+  另开 issue，不在本 issue 扩源。
 - 打分是可解释的规则加权，不做价格预测、不给目标价、不接交易。
