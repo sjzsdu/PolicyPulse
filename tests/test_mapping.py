@@ -62,8 +62,9 @@ def test_build_candidates_filters_st_and_small_cap():
     assert codes == ["600519", "000001"], "按市值降序"
 
 
-def test_top_n_per_sector_is_honored():
-    settings = Settings(top_n_per_sector=1)
+def test_candidates_cap_is_honored():
+    """旧的「每板块 Top-N」已移除：现在是全局候选数上限（按市值截断）。"""
+    settings = Settings(max_candidates_per_signal=1)
     client = _FakeClient({"低空经济": ["000001", "600519"]})
     matches = [SectorMatch("低空经济", "低空经济", "通达信概念", "block_gn.dat", "exact", 1.0)]
     assert len(build_candidates(matches, client, settings)) == 1

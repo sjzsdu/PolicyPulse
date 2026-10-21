@@ -1,21 +1,31 @@
 # 可选：不想用默认值时改这里。缺省时 policypulse 用 Settings 的内置默认值。
-# lookback_days 仅在显式 --since 补跑（--since 不带 N）时作为默认补跑天数；
-# 默认日报固定只收 [昨日, 今日]，窗口内无新增就写「今日无新增政策/事件」。
-lookback_days: 14
+<# 注意：不再有 lookback_days。日报默认只看「目标日 + 前一天」，
+# 要回补更早的历史请用命令行 `policypulse run --since N`（窗口 [目标日-N, 目标日]）；
+# 窗口内无新增就写「今日无新增政策/事件」，不回退抓旧稿。
+daily_window_days: 2
 max_docs_per_source: 12
 min_confidence: 0.45
 
+# 打分权重（score-v2）：公司级相关性主导，市值只作并列决胜位。
 weights:
-  strength: 0.35
-  relevance: 0.25
-  liquidity: 0.20
-  breadth: 0.10
+  strength: 0.25
+  relevance: 0.50
+  liquidity: 0.10
+  breadth: 0.05
   novelty: 0.10
+
+# 公司级相关性闸门：用 F10 主营/营收构成与主题业务关键词求交集，
+# 低于 min_relevance 的个股不进日报正文（仍入库，便于审计）。
+relevance_gate: true
+relevance_gate_mode: demote      # demote=压相关性后按截断过滤；drop=直接不产出
+min_relevance: 0.5
+max_candidates_per_signal: 300
+company_profile_ttl_hours: 168   # F10 公司画像缓存 7 天
 
 min_market_cap_yi: 30.0
 exclude_bj: true
-top_n_per_sector: 5
 max_tickers_per_signal: 10
+deepdive_top_k: 3                # 个股深度研读取 Top-K；需要 LLM，未配置则整段跳过
 
 request_timeout: 25.0
 request_retries: 2

@@ -51,8 +51,24 @@ def test_rank_respects_max_tickers_and_assigns_rank():
     assert [c.score for c in ranked] == sorted((c.score for c in ranked), reverse=True)
 
 
-def test_score_version_is_stable():
-    assert SCORE_VERSION == "score-v1"
+def test_score_version_and_weights():
+    """口径变了版本号必须变：score-v2 = 公司级相关性主导 + 全局相关性截断。"""
+    import pytest
+
+    assert SCORE_VERSION == "score-v2"
+    w = Settings().weights
+    assert w["relevance"] == pytest.approx(0.50)
+    assert w["strength"] == pytest.approx(0.25)
+    assert sum(w.values()) == pytest.approx(1.0)
+
+
+def test_rank_drops_below_global_relevance_cutoff():
+    """闸门把相关性压到 0.25 的个股不能靠市值/分数挤回正文。"""
+    kept = _cand("600001", 5000.0, conf=1.0)
+    demoted = _cand("600002", 9000.0, conf=1.0)
+    demoted.relevance = 0.25
+    ranked = rank(_sig(), [kept, demoted], Settings())
+    assert [c.ticker.code for c in ranked] == ["600001"]
 
 
 def test_why_is_short_and_distinct():

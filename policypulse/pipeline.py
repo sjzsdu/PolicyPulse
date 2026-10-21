@@ -12,7 +12,16 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from policypulse import llm
-from policypulse.config import DISCLAIMER, REPO_ROOT, Settings, load_sources, load_theme_alias
+from policypulse.clustering import PolicyEvent, cluster_events
+from policypulse.config import (
+    DISCLAIMER,
+    REPO_ROOT,
+    Settings,
+    load_sources,
+    load_theme_alias,
+    load_theme_business,
+)
+from policypulse.deepdive import DeepDive, build_deepdives
 from policypulse.extract import classify_meeting_type, extract_signals, verify_quote
 from policypulse.http import FetchError, Fetcher, content_hash
 from policypulse.mapping import build_candidates, match_sectors
@@ -57,6 +66,10 @@ class RunResult:
     failed_sources: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     duplicates_skipped: int = 0
+    # 事件聚类后的政策事件（每篇文档/发布会一条，个股已按代码去重）
+    events: list[PolicyEvent] = field(default_factory=list)
+    # 个股深度研读；空列表 + warnings 里的跳过说明 = 没配 LLM 或凑不出溯源
+    deepdives: list[DeepDive] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
 
 
@@ -123,12 +136,26 @@ def _in_window(published: str, start: str, end: str) -> bool:
 
 def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: str,
                     window_end: str, snapshot_dir: Path, run_id: str,
-                    store: Store | None = None) -> tuple[list[DocRecord], list[str], int]:
+                    store: Store | None = None,
+                    diagnostics: dict | None = None) -> tuple[list[DocRecord], list[str], int]:
+    """抓取窗口内文档。
+
+    本 issue 第 1 点：**不再有「窗口内无更新就退回抓入口页最近几条」的兜底**。
+    栏目当天没更新就是没更新，日报如实写「今日无新增政策 / 事件」，
+    绝不把 10 月 8 日的旧稿塞进 10 月 20 日的日报。
+
+    `diagnostics`（可选）：调用方可传 dict 接收
+    `discovered`（discover 成功的源）与 `no_update`（窗口内无更新的源），
+    不改变返回值的 3 元组契约。
+    """
     docs: list[DocRecord] = []
     failed: list[str] = []
     warnings: list[str] = []
     seen_hashes: dict[str, str] = {}
     duplicates_skipped = 0
+    diag = diagnostics if diagnostics is not None else {}
+    discovered: list[str] = diag.setdefault("discovered", [])
+    no_update: list[str] = diag.setdefault("no_update", [])
 
     for spec in specs:
         if not spec.enabled:
@@ -141,6 +168,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
         except (FetchError, KeyError, ValueError) as exc:
             failed.append(f"{spec.id}: {type(exc).__name__}: {exc}")
             continue
+        discovered.append(spec.id)
 
         # 本地 inbound：没有溯源 URL 的文件不入库，但不能静默跳过
         missing = getattr(adapter, "missing_source_url", None)
@@ -166,8 +194,9 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
             picked.append(item)
             if len(picked) >= settings.max_docs_per_source:
                 break
-        # 窗口内（含无日期兜过）没有可收条目就跳过该源：不回退抓旧文凑数，
-        # 空日报由报告显式写「今日无新增政策/事件」，历史内容只走 --since 补跑
+        # 窗口内没有更新 = 真的没有更新：如实记录，不退回抓旧稿
+        if items and not picked:
+            no_update.append(spec.id)
 
         for item in picked:
             try:
@@ -243,11 +272,18 @@ def _emit_warnings(fetcher, messages: list[str]) -> None:
 
 
 def build_conclusions(docs, store: Store, settings: Settings, client: TongstockClient,
-                      run_id: str, alias_map) -> tuple[list, list[dict]]:
-    """抽取信号并映射到个股；返回 (signals, conclusions)。"""
+                      run_id: str, alias_map,
+                      gate_stats: dict | None = None,
+                      business_map: dict | None = None) -> tuple[list, list[dict]]:
+    """抽取信号并映射到个股；返回 (signals, conclusions)。
+
+    `gate_stats`（可选）：接收公司级相关性闸门的逐档计数，
+    用于在日报里说明「多少只被放行 / 压低 / 拿不到画像」。
+    """
     concept_sectors = list(client.sectors(CONCEPT_FILE).keys())
     industry_sectors = list(client.sectors(INDUSTRY_FILE).keys())
     universe = client.tickers()
+    stats = gate_stats if gate_stats is not None else {}
 
     all_signals = []
     conclusions: list[dict] = []
@@ -273,7 +309,8 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
             all_signals.append(sig)
 
             matches = match_sectors(sig.theme_tags, concept_sectors, industry_sectors, alias_map)
-            candidates = build_candidates(matches, client, settings)
+            candidates = build_candidates(matches, client, settings, alias_map,
+                                          business_map, stats)
             ranked = rank(sig, candidates, settings)
 
             tickers = []
@@ -286,7 +323,10 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
                 store.upsert_signal_ticker(sig.signal_id, cand.ticker.code, why_of(sig, cand),
                                            cand.score, pos, cand.mapping_path,
                                            cand.mapping_confidence, cand.sector_name,
-                                           cand.sector_source)
+                                           cand.sector_source,
+                                           relevance=cand.relevance,
+                                           gate_basis=cand.gate_basis,
+                                           gate_evidence=cand.gate_evidence)
                 tickers.append({
                     "ticker_code": cand.ticker.code,
                     "ticker_name": cand.ticker.name,
@@ -300,11 +340,15 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
                     "rank": pos,
                     "mapping_path": cand.mapping_path,
                     "mapping_confidence": cand.mapping_confidence,
+                    "relevance": cand.relevance,
+                    "gate_basis": cand.gate_basis,
+                    "gate_evidence": cand.gate_evidence,
                 })
 
             conclusions.append({
                 "signal_id": sig.signal_id,
                 "doc_id": doc.doc_id,
+                "doc_title": doc.title,
                 "summary": sig.summary,
                 "direction": sig.direction,
                 "strength": sig.strength,
@@ -371,18 +415,28 @@ def _signals_from_llm(doc, store: Store, settings: Settings):
     return out
 
 
+def window_for(target: date, since_days: int | None, settings: Settings) -> tuple[str, str, int]:
+    """统计窗口 [target-N, target]；不传 since_days 用默认的 daily_window_days-1。
+
+    默认值刻意只回看 1 天：日报是「今天」的日报，往前 14 天是旧文章进日报的根因。
+    想要更长的历史必须显式 `--since N`（回补），并在产物里能看出这是回补。
+    """
+    days = since_days if since_days is not None else max(settings.daily_window_days - 1, 0)
+    return (target - timedelta(days=days)).isoformat(), target.isoformat(), days
+
+
 def run(settings: Settings, paths, target_date: date | None = None,
         sources_file: Path | None = None, refresh_market: bool = False,
         only_sources: list[str] | None = None, fetcher: Fetcher | None = None,
         market_client=None, since_days: int | None = None) -> RunResult:
+    """跑一轮日报。
+
+    窗口口径（本 issue 第 1 点）：默认只看 `daily_window_days` 天（= 目标日与前一天），
+    想回补更早的日子必须显式传 `--since N`（窗口 [target-N, target]）。
+    旧的 `lookback_days=14` 每天默认往前看 14 天，是「日报里出现旧文章」的直接原因。
+    """
     target = target_date or date.today()
-    # 默认日报只收 [昨日, 今日]（容忍晚间/次日见报）；--since N 显式补跑才拉长窗口，
-    # --since 1 即只收当日
-    if since_days and since_days >= 1:
-        window_start = (target - timedelta(days=since_days - 1)).isoformat()
-    else:
-        window_start = (target - timedelta(days=1)).isoformat()
-    window_end = target.isoformat()
+    window_start, window_end, days = window_for(target, since_days, settings)
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     all_specs = load_sources(sources_file) if sources_file else load_sources()
@@ -399,7 +453,9 @@ def run(settings: Settings, paths, target_date: date | None = None,
     snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     alias_map = load_theme_alias()
+    business_map = load_theme_business()
     warnings: list[str] = []
+    diagnostics: dict = {}
     owns_fetcher = fetcher is None
     if owns_fetcher:
         # E：不再硬编码 2.0，默认间隔只作兜底，真实间隔由 sources.yaml 逐源下发
@@ -408,7 +464,8 @@ def run(settings: Settings, paths, target_date: date | None = None,
                           robots_unavailable_interval=settings.robots_unavailable_interval)
     try:
         docs, failed, duplicates = fetch_documents(
-            fetcher, specs, settings, window_start, window_end, snapshot_dir, run_id, store)
+            fetcher, specs, settings, window_start, window_end, snapshot_dir, run_id, store,
+            diagnostics)
         warnings.extend(getattr(fetcher, "warnings", []))
         source_rows = _source_compliance(all_specs, docs, fetcher)
     finally:
@@ -417,36 +474,55 @@ def run(settings: Settings, paths, target_date: date | None = None,
 
     client = market_client or TongstockClient(settings, cache_dir=paths.cache,
                                               refresh=refresh_market)
+    gate_stats: dict = {}
     try:
-        signals, conclusions = build_conclusions(docs, store, settings, client, run_id, alias_map)
+        signals, conclusions = build_conclusions(docs, store, settings, client, run_id,
+                                                 alias_map, gate_stats, business_map)
     except TongstockError as exc:
         store.finish_run(run_id, "failed", len(docs), 0, 0, notes=f"tongstock: {exc}")
         raise
 
-    ticker_count = sum(len(c["tickers"]) for c in conclusions)
+    # 事件聚类：同文档 / 同发布会的信号聚成一个政策事件，个股按代码去重
+    events = cluster_events(conclusions)
+    # 个股深度研读：可插拔模块，无 LLM 时整段跳过并写明原因
+    dives, deepdive_notes = build_deepdives(events, client, settings)
+    warnings.extend(deepdive_notes)
+
+    ticker_count = sum(len(e["tickers"]) for e in conclusions)
     store.finish_run(run_id, "ok", len(docs), len(signals), ticker_count,
                      notes="; ".join(failed)[:500])
 
     result = RunResult(run_id=run_id, window_start=window_start, window_end=window_end,
                        docs=docs, signals=signals, conclusions=conclusions,
                        failed_sources=failed, warnings=warnings,
-                       duplicates_skipped=duplicates)
-    ok_sources = {d.source_id for d in docs}
-    # 成功率只统计需要联网的源：本地 inbound 目录空着是常态，不该算源挂掉
+                       duplicates_skipped=duplicates,
+                       events=events, deepdives=dives)
     net_source_ids = {s.id for s in specs if s.adapter != "local_inbound"}
-    ok_net = ok_sources & net_source_ids
+    # 源成功 = discover 成功（没抛异常），与「窗口内有没有更新」无关；
+    # 后者单列 sources_no_update，不能再算成源挂了，也不能靠抓旧稿把数字凑出来
+    discovered = set(diagnostics.get("discovered", []))
+    ok_net = discovered & net_source_ids
+    no_update = [s for s in diagnostics.get("no_update", []) if s in net_source_ids]
     result.stats = {
         "docs": len(docs),
         "signals": len(signals),
         "with_tickers": sum(1 for c in conclusions if c["tickers"]),
         "ticker_rows": ticker_count,
+        "events": len(events),
+        "event_conclusions": sum(len(e.conclusions) for e in events),
+        "window_start": window_start,
+        "window_end": window_end,
+        "window_days": days + 1,
+        "since_days": days,
         "sources_total": len(net_source_ids),
-        # 一个源只要抓到 1 篇就算成功；单篇失败只计条目，不算源挂掉
         "sources_ok": len(ok_net),
         "sources_failed": len(net_source_ids) - len(ok_net),
+        "sources_no_update": no_update,
         "local_inbound_sources": len(specs) - len(net_source_ids),
         "fetch_failures": len(failed),
         "duplicates_skipped": duplicates,
+        "gate": gate_stats,
+        "deepdive_count": len(dives),
         # 央行相关内容条数与来源：WAN-10 的验收要能指认
         "pbc_related_docs": sum(1 for d in docs if is_pbc_related(d.title, d.body)),
         "pbc_related_sources": sorted({d.source_id for d in docs if is_pbc_related(d.title, d.body)}),

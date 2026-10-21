@@ -11,7 +11,8 @@ def _result() -> RunResult:
     r.stats = {
         "docs": 3, "signals": 4, "with_tickers": 1, "ticker_rows": 2,
         "sources_total": 6, "sources_failed": 1, "tongstock_calls": 5, "llm_enabled": False,
-        "duplicates_skipped": 0, "min_strength_for_report": 3,
+        "duplicates_skipped": 0, "sources_no_update": [], "events": 1,
+        "gate": {}, "deepdive_count": 0, "min_strength_for_report": 3,
     }
     r.failed_sources = ["miit: timeout"]
     r.conclusions = [{
@@ -93,26 +94,31 @@ def test_markdown_snapshot_path_is_relative(tmp_path):
     assert Path(payload["conclusions"][0]["raw_snapshot_path"]).is_absolute()
 
 
-def test_empty_report_declares_no_new_items():
-    """空日报必须显式写「今日无新增政策/事件」，不再兜底抓旧文（WAN-11 第 1 点）。"""
-    r = RunResult(run_id="r2", window_start="2026-10-18", window_end="2026-10-19")
-    r.stats = {
-        "docs": 0, "signals": 0, "with_tickers": 0, "ticker_rows": 0,
-        "sources_total": 1, "sources_failed": 0, "tongstock_calls": 0, "llm_enabled": False,
-        "duplicates_skipped": 0, "min_strength_for_report": 3,
+def test_empty_day_reports_nothing_and_keeps_no_fallback_language():
+    """第 1 点：兜底抓旧的措辞必须彻底消失；窗口内没稿写「今日无新增政策 / 事件」。"""
+    from policypulse.config import EMPTY_DAY_NOTICE
+
+    empty = RunResult(run_id="r0", window_start="2026-10-19", window_end="2026-10-20")
+    empty.stats = {
+        "docs": 0, "signals": 0, "with_tickers": 0, "ticker_rows": 0, "events": 0,
+        "sources_total": 6, "sources_failed": 0, "sources_ok": 6,
+        "sources_no_update": ["gov_cn"], "tongstock_calls": 0, "llm_enabled": False,
+        "duplicates_skipped": 0, "min_strength_for_report": 3, "gate": {},
     }
-    md = render_markdown(r)
-    assert "今日无新增政策/事件" in md
-    assert "不再回退抓取旧文" in md
-    assert "窗口外兜底" not in md, "兜底口径已删除，产物里不应再出现"
+    empty.failed_sources = []
+    empty.warnings = []
+    md = render_markdown(empty)
+    assert EMPTY_DAY_NOTICE in md
+    assert "窗口外兜底" not in md
+    assert "gov_cn" in md, "哪些源没更新要如实写出来"
 
-    out = render_html(r)
-    assert "今日无新增政策/事件" in out, "空日报的 HTML 也必须有声明，与 Markdown 对齐"
-    assert "窗口外兜底" not in out
+    # 有产出的报告里同样不能残留兜底措辞
+    assert "窗口外兜底" not in render_markdown(_result())
 
-    payload = json.loads(render_json(r))
-    assert payload["window"]["start"] == "2026-10-18"
-    assert payload["conclusions"] == []
+
+def test_markdown_states_the_company_gate():
+    md = render_markdown(_result())
+    assert "公司级相关性闸门" in md
 
 
 def _with_compliance(result: RunResult) -> RunResult:

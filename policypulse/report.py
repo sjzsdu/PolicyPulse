@@ -1,4 +1,8 @@
-"""日报渲染：Markdown（主交付）+ JSON + 单页 HTML。"""
+"""日报渲染：Markdown（主交付）+ JSON + 单页 HTML。
+
+正文按「政策事件」组织（同文档/同发布会的信号聚成一条事件，个股按代码去重一张表），
+不再逐条信号重复贴一模一样的个股表。
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,8 @@ import html
 import json
 from pathlib import Path
 
-from policypulse.config import DISCLAIMER, MAPPING_CAVEAT, REPO_ROOT
+from policypulse.clustering import _ensure_events, merge_tickers
+from policypulse.config import DISCLAIMER, EMPTY_DAY_NOTICE, GATE_CAVEAT, MAPPING_CAVEAT, REPO_ROOT
 from policypulse.pipeline import RunResult
 
 
@@ -41,9 +46,28 @@ def _compliance_lines(result: RunResult) -> list[str]:
     return lines
 
 
+def _is_bullish(c: dict, min_strength: int) -> bool:
+    return c["direction"] == "利好" and c["strength"] >= min_strength and c["tickers"]
+
+
+def _gate_line(gate: dict) -> str:
+    if not gate:
+        return "—"
+    labels = {"profile_hit": "业务命中放行", "weak_hit": "经营范围弱命中",
+              "no_profile": "无画像放行", "profile_miss": "无实质交集",
+              "disabled": "闸门关闭", "dropped": "直接剔除"}
+    parts = [f"{labels.get(k, k)} {v}" for k, v in gate.items() if v]
+    return "、".join(parts) or "—"
+
+
+def _source_links(c: dict) -> str:
+    return f"[{c['source_url']}]({c['source_url']})"
+
+
 def render_markdown(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
+    events = _ensure_events(result)
     lines: list[str] = []
     lines.append(f"# PolicyPulse 日报 {result.window_end}")
     lines.append("")
@@ -53,16 +77,19 @@ def render_markdown(result: RunResult) -> str:
     lines.append("")
     lines.append("| 指标 | 值 |")
     lines.append("|---|---|")
-    lines.append(f"| 统计窗口 | {result.window_start} ~ {result.window_end} |")
+    lines.append(f"| 统计窗口 | {result.window_start} ~ {result.window_end}"
+                 f"（{s.get('window_days', '?')} 天） |")
     lines.append(f"| run_id | `{result.run_id}` |")
     lines.append(f"| 抓取文档 | {s['docs']} |")
+    lines.append(f"| 政策事件（聚类后） | {s.get('events', len(events))} |")
     lines.append(f"| 抽取信号 | {s['signals']} |")
     lines.append(f"| 有映射个股的信号 | {s['with_tickers']} |")
-    lines.append(f"| 个股结论行数 | {s['ticker_rows']} |")
-    lines.append(f"| 信息源（成功/总数） | {s.get('sources_ok', s['sources_total'] - s['sources_failed'])}"
-                 f" / {s['sources_total']} |")
+    lines.append(f"| 个股结论行数（事件内去重后） | {s['ticker_rows']} |")
+    lines.append(f"| 信息源（可用/总数） | {s.get('sources_ok', 0)} / {s['sources_total']} |")
     lines.append(f"| 抓取失败条目 | {s.get('fetch_failures', 0)} |")
     lines.append(f"| 跨 run 去重跳过 | {s.get('duplicates_skipped', 0)} |")
+    lines.append(f"| 公司级相关性闸门 | {_gate_line(s.get('gate', {}))} |")
+    lines.append(f"| 个股深度研读 | {s.get('deepdive_count', 0)} 条 |")
     lines.append(f"| LLM 抽取 | {'开启' if s['llm_enabled'] else '关闭（规则抽取）'} |")
     lines.append(f"| tongstock 调用（不含缓存命中） | {s['tongstock_calls']} |")
     pbc_docs = s.get("pbc_related_docs", 0)
@@ -71,6 +98,8 @@ def render_markdown(result: RunResult) -> str:
                  f"{'（来源：' + '、'.join(pbc_src) + '）' if pbc_src else ''} |")
     lines.append("")
     lines.append(f"> 口径说明：{MAPPING_CAVEAT}")
+    lines.append("")
+    lines.append(f"> {GATE_CAVEAT}")
     lines.append("")
 
     warned: list[str] = list(result.failed_sources) + list(result.warnings)
@@ -84,17 +113,32 @@ def render_markdown(result: RunResult) -> str:
     if result.duplicates_skipped:
         lines.append(f"- 另有 {result.duplicates_skipped} 篇文档正文指纹已在库（跨 run 去重），本次未重复抽取。")
         lines.append("")
-    if not result.docs and not result.failed_sources:
-        lines.append(f"**今日无新增政策/事件。**统计窗口 {result.window_start} ~ {result.window_end} "
-                     "内没有新发布内容，不再回退抓取旧文凑数（历史内容用 `--since N` 显式补跑）。")
+    no_update = s.get("sources_no_update") or []
+    if no_update:
+        lines.append(f"- 窗口内无更新的源：{'、'.join(no_update)}（如实记录，不再回退抓旧稿）。")
         lines.append("")
+
+    if not result.conclusions:
+        lines.append("## 今日无新增政策 / 事件")
+        lines.append("")
+        lines.append(f"统计窗口 {result.window_start} ~ {result.window_end} 内没有抓到新文档，"
+                     "或文档未产生可映射的信号。需要更早的稿子请显式回补："
+                     "`policypulse run --since N`。")
+        lines.append("")
+        lines.extend(_compliance_lines(result))
+        lines.append("## 运行元信息")
+        lines.append("")
+        lines.append(f"- 数据库：`data/policypulse.db`（run_id `{result.run_id}`）")
+        lines.append("")
+        lines.append(f"> {DISCLAIMER}")
+        return "\n".join(lines)
 
     bullish_all = [c for c in result.conclusions if c["direction"] == "利好" and c["tickers"]]
     bullish = [c for c in bullish_all if c["strength"] >= min_strength]
     filtered_out = len(bullish_all) - len(bullish)
     bullish.sort(key=lambda c: (-c["strength"], -c["confidence"]))
 
-    lines.append("## 利好信号与候选个股")
+    lines.append("## 政策事件与候选个股")
     lines.append("")
     if filtered_out:
         lines.append(f"另有 {filtered_out} 条利好结论力度 < {min_strength}，未列入本表，详见同名 JSON 与数据库。")
@@ -103,31 +147,47 @@ def render_markdown(result: RunResult) -> str:
         lines.append(f"本轮没有命中「利好、有板块映射且力度 ≥ {min_strength}」的信号。")
         lines.append("")
 
-    for idx, c in enumerate(bullish, start=1):
-        lines.append(f"### {idx}. {c['summary']}")
+    shown = 0
+    for ev in events:
+        qualifying = [c for c in ev.conclusions if _is_bullish(c, min_strength)]
+        if not qualifying:
+            continue
+        shown += 1
+        rows = merge_tickers(qualifying)
+        doc_count = len(ev.doc_ids)
+        lines.append(f"### {shown}. {ev.title}")
         lines.append("")
-        lines.append(f"- 信号ID：`{c['signal_id']}`")
-        lines.append(f"- 力度/周期/性质：strength **{c['strength']}** / {c['horizon']} / {c['novelty']}")
-        lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
-        lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
-        lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
-        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
-        lines.append(f"- 原文：[{c['source_url']}]({c['source_url']})")
-        lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
+        lines.append(f"- 事件ID：`{ev.event_id}`（合并 {doc_count} 篇文档）")
+        lines.append(f"- 来源：{ev.org or '—'} · {ev.meeting_type or '—'} · "
+                     f"{ev.published_at or '日期未知'}")
+        lines.append(f"- 原文：[{ev.source_url}]({ev.source_url})")
+        lines.append(f"- 快照：`{relative_snapshot(ev.snapshot_path)}`")
+        lines.append(f"- 事件内信号 {len(ev.conclusions)} 条，其中力度 ≥ {min_strength} 且有映射 "
+                     f"{len(qualifying)} 条")
         lines.append("")
-        lines.append(f"> {c['quote']}")
-        lines.append("")
-        if c["tickers"]:
-            lines.append("| # | 代码 | 名称 | 板块 | 市值(亿) | score | 受益理由 | 映射路径 |")
-            lines.append("|---|---|---|---|---|---|---|---|")
-            for t in c["tickers"]:
-                lines.append(
-                    f"| {t['rank']} | {t['ticker_code']} | {t['ticker_name']} | "
-                    f"{t['sector_name']}({t['sector_source']}) | {t['market_cap']:.1f} | {t['score']} | "
-                    f"{t['why']} | {t['mapping_path']} |"
-                )
-        else:
-            lines.append("_未映射到板块（宁缺勿错），该信号仍保留溯源。_")
+        for c in qualifying:
+            lines.append(f"#### `{c['signal_id']}` {c['summary']}")
+            lines.append("")
+            lines.append(f"- 信号ID：`{c['signal_id']}`")
+            lines.append(f"- 力度/周期/性质：strength **{c['strength']}** / {c['horizon']} / {c['novelty']}")
+            lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
+            lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
+            lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
+            lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
+            lines.append(f"- 原文：{_source_links(c)}")
+            lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
+            lines.append("")
+            lines.append(f"> {c['quote']}")
+            lines.append("")
+        lines.append("| # | 代码 | 名称 | 板块 | 市值(亿) | score | 相关性 | 受益理由 | 映射路径 |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for i, t in enumerate(rows, start=1):
+            rel = t.get("relevance", t.get("mapping_confidence", 0))
+            lines.append(
+                f"| {i} | {t['ticker_code']} | {t['ticker_name']} | "
+                f"{t['sector_name']}({t['sector_source']}) | {t['market_cap']:.1f} | {t['score']} | "
+                f"{rel} | {t['why']} | {t['mapping_path']} |"
+            )
         lines.append("")
 
     bullish_ids = {c["signal_id"] for c in bullish}
@@ -141,6 +201,22 @@ def render_markdown(result: RunResult) -> str:
             lines.append(f"| `{c['signal_id']}` | {c['direction']} | {c['strength']} | "
                          f"{c['summary'][:40]} | [{c['org']}]({c['source_url']}) |")
         lines.append("")
+
+    deepdives = list(getattr(result, "deepdives", None) or [])
+    if deepdives:
+        lines.append("## 个股深度研读（每条结论均带溯源）")
+        lines.append("")
+        for d in deepdives:
+            lines.append(f"### {d.ticker_name}（{d.ticker_code}）· {d.policy_title}")
+            lines.append("")
+            lines.append(f"- 政策：{d.policy_summary}")
+            lines.append(f"- 传导路径：{d.transmission}")
+            lines.append(f"- 竞争地位：{d.competition}")
+            lines.append(f"- 影响判断：{d.impact}")
+            if d.risks:
+                lines.append(f"- 风险提示：{'；'.join(d.risks)}")
+            lines.append(f"- 溯源：{'; '.join(f'{x['label']}（`{x['ref']}`）' for x in d.sources)}")
+            lines.append("")
 
     lines.extend(_compliance_lines(result))
 
@@ -164,6 +240,25 @@ def render_json(result: RunResult) -> str:
         "failed_sources": result.failed_sources,
         "warnings": result.warnings,
         "conclusions": result.conclusions,
+        "events": [
+            {
+                "event_id": e.event_id, "title": e.title, "org": e.org,
+                "meeting_type": e.meeting_type, "published_at": e.published_at,
+                "source_url": e.source_url, "doc_ids": e.doc_ids,
+                "signal_ids": [c["signal_id"] for c in e.conclusions],
+                "tickers": e.tickers,
+            }
+            for e in _ensure_events(result)
+        ],
+        "deepdives": [
+            {
+                "ticker_code": d.ticker_code, "ticker_name": d.ticker_name,
+                "policy_title": d.policy_title, "transmission": d.transmission,
+                "competition": d.competition, "impact": d.impact,
+                "risks": d.risks, "sources": d.sources,
+            }
+            for d in (getattr(result, "deepdives", None) or [])
+        ],
         "disclaimer": DISCLAIMER,
         "mapping_caveat": MAPPING_CAVEAT,
     }
@@ -173,24 +268,37 @@ def render_json(result: RunResult) -> str:
 def render_html(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
+    events = _ensure_events(result)
     rows: list[str] = []
-    for c in result.conclusions:
-        if c["direction"] != "利好" or not c["tickers"] or c["strength"] < min_strength:
+    for ev in events:
+        qualifying = [c for c in ev.conclusions if _is_bullish(c, min_strength)]
+        if not qualifying:
             continue
+        table_rows = merge_tickers(qualifying)
         trows = "".join(
-            f"<tr><td>{t['rank']}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
+            f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
             f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
+            f"<td>{t.get('relevance', t.get('mapping_confidence', 0))}</td>"
             f"<td>{_esc(t['why'])}</td>"
-            f"<td><a href='{_esc(c['source_url'])}' target='_blank'>原文</a></td></tr>"
-            for t in c["tickers"]
+            f"<td><a href='{_esc(ev.source_url)}' target='_blank'>原文</a></td></tr>"
+            for i, t in enumerate(table_rows, start=1)
+        )
+        sigs = "".join(
+            f"<h4><code>{_esc(c['signal_id'])}</code> {_esc(c['summary'])}</h4>"
+            f"<p class='meta'>strength {c['strength']} · 置信度 {c['confidence']} · "
+            f"引用校验 {'通过' if c['quote_verified'] else '未通过'} · {_esc(c['org'])} · "
+            f"{_esc(c['published_at'])}</p>"
+            f"<blockquote>{_esc(c['quote'])}</blockquote>"
+            for c in qualifying
         )
         rows.append(
-            f"<section><h3>{_esc(c['summary'])}</h3>"
-            f"<p class='meta'>{_esc(c['org'])} · {_esc(c['meeting_type'])} · {_esc(c['published_at'])} · "
-            f"strength {c['strength']} · 置信度 {c['confidence']}</p>"
-            f"<blockquote>{_esc(c['quote'])}</blockquote>"
+            f"<section><h3>{_esc(ev.title)}</h3>"
+            f"<p class='meta'>{_esc(ev.org)} · {_esc(ev.meeting_type)} · {_esc(ev.published_at)} · "
+            f"合并 {len(ev.doc_ids)} 篇文档 · 信号 {len(ev.conclusions)} 条</p>"
+            f"{sigs}"
             f"<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
-            f"<th>score</th><th>理由</th><th>溯源</th></tr></thead><tbody>{trows}</tbody></table></section>"
+            f"<th>score</th><th>相关性</th><th>理由</th><th>溯源</th></tr></thead>"
+            f"<tbody>{trows}</tbody></table></section>"
         )
 
     compliance = ""
@@ -206,17 +314,16 @@ def render_html(result: RunResult) -> str:
             "<th>robots 判定</th><th>判定依据</th><th>本轮文档</th></tr></thead>"
             f"<tbody>{cells}</tbody></table>")
 
-    empty_day = ""
-    if not result.docs and not result.failed_sources:
-        empty_day = (f"<p class='caveat'>今日无新增政策/事件。统计窗口 {_esc(result.window_start)} ~ "
-                     f"{_esc(result.window_end)} 内没有新发布内容，不再回退抓取旧文凑数"
-                     "（历史内容用 --since N 显式补跑）。</p>")
+    body = "".join(rows) or f"<p>{_esc(EMPTY_DAY_NOTICE)}</p>"
+    if not result.conclusions and s["docs"] == 0:
+        body = (f"<p><strong>{_esc(EMPTY_DAY_NOTICE)}</strong>（窗口 "
+                f"{_esc(result.window_start)} ~ {_esc(result.window_end)}）</p>")
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PolicyPulse 日报 {_esc(result.window_end)}</title>
 <style>
 body{{font-family:-apple-system,"PingFang SC",Helvetica,Arial,sans-serif;margin:32px auto;max-width:1080px;color:#1b1b1b;line-height:1.6}}
-h1{{font-size:24px}} h3{{font-size:18px;margin-bottom:4px}}
+h1{{font-size:24px}} h3{{font-size:18px;margin-bottom:4px}} h4{{font-size:15px;margin-bottom:2px}}
 .meta{{color:#666;font-size:13px;margin-top:0}}
 blockquote{{border-left:3px solid #c9a227;margin:8px 0;padding:8px 12px;background:#fbf8ef;color:#333}}
 table{{border-collapse:collapse;width:100%;margin:8px 0 20px;font-size:14px}}
@@ -228,9 +335,9 @@ th{{background:#f5f5f5}}
 <h1>PolicyPulse 日报 {_esc(result.window_end)}</h1>
 <p class="disc">{_esc(DISCLAIMER)}</p>
 <p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
-<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
-{empty_day}
-{''.join(rows) or '<p>本轮没有命中「利好且有板块映射」的信号。</p>'}
+<p class="caveat">{_esc(GATE_CAVEAT)}</p>
+<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 事件 {s.get('events', len(events))} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
+{body}
 {compliance}
 <p class="disc">{_esc(DISCLAIMER)}</p>
 </body></html>"""

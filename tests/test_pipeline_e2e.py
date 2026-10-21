@@ -7,14 +7,13 @@ HTTP 层用冻结的**真实** gov.cn 页面，tongstock 层用一个最小数�
 from __future__ import annotations
 
 import json
-from datetime import date
 from pathlib import Path
 
 import pytest
 
 from policypulse.config import Settings, default_paths, load_theme_alias
 from policypulse.http import Fetcher
-from policypulse.pipeline import build_conclusions, doc_id_for, fetch_documents, run as run_pipeline
+from policypulse.pipeline import build_conclusions, doc_id_for, fetch_documents
 from policypulse.report import render_markdown
 from policypulse.store import Store
 from policypulse.tongstock import CONCEPT_FILE, INDUSTRY_FILE, Ticker
@@ -127,7 +126,7 @@ def test_end_to_end_offline(workspace):
         "stats": {"docs": 1, "signals": len(signals), "with_tickers": len(with_tickers),
                   "ticker_rows": len(codes), "sources_total": 1, "sources_failed": 0,
                   "tongstock_calls": 0, "llm_enabled": False, "duplicates_skipped": 0,
-                  "min_strength_for_report": 3},
+                  "sources_no_update": [], "gate": {}, "min_strength_for_report": 3},
     })())
     assert ARTICLE_URL in md
     assert "600989" in md
@@ -159,23 +158,12 @@ def test_dedupe_can_be_disabled(workspace):
     store.close()
 
 
-SOURCES_YAML = """sources:
-  - id: gov_zhengce
-    name: 最新政策
-    org: 国务院
-    tier: 中央
-    adapter: gov_json_feed
-    url: https://www.gov.cn/zhengce/zuixin/
-    column: 政策 > 最新政策
-    meeting_type_hint: 政策文件
-    rate_limit_seconds: 2.0
-    feed_url: https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json
-    enabled: true
-"""
+def test_out_of_window_documents_are_not_fetched(workspace):
+    """第 1 点：窗口内没有更新 = 不抓。
 
-
-def test_empty_window_does_not_fall_back_to_old_items(workspace):
-    """窗口内无更新就跳过该源：不回退抓入口页旧文凑数（WAN-11 第 1 点）。"""
+    旧实现会「退回抓入口页最近 3 条」，把 10 月的稿子塞进 1 月的日报；
+    现在必须是空结果 + 明确记录「该源窗口内无更新」。
+    """
     paths, snapshot_dir = workspace
     store = Store(paths.db)
     settings = Settings()
@@ -183,45 +171,11 @@ def test_empty_window_does_not_fall_back_to_old_items(workspace):
         "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
         ARTICLE_URL: ARTICLE,
     })
-    docs, _, _ = fetch_documents(fetcher, _specs(), settings, "2026-01-01", "2026-01-02",
-                                 snapshot_dir, "run-test", store)
-    assert docs == [], "窗口外旧文不能冒进当日产物"
-    assert ARTICLE_URL not in fetcher.requests, "兜底回抓旧文已被删除，不应请求正文页"
+    diag: dict = {}
+    docs, failed, dupes = fetch_documents(fetcher, _specs(), settings, "2026-01-01",
+                                          "2026-01-02", snapshot_dir, "run-test", store, diag)
+    assert docs == [], "窗口外的稿子一条都不能进产物"
+    assert failed == [] and dupes == 0, "源本身是可用的，只是窗口内没有更新"
+    assert diag["discovered"] == ["gov_zhengce"]
+    assert diag["no_update"] == ["gov_zhengce"]
     store.close()
-
-
-def test_default_window_is_yesterday_and_today__since_only_for_backfill(workspace):
-    """默认日报恒为 [target-1d, target]（lookback_days=14 不参与）；
-    --since N 显式补跑才拉长窗口（WAN-11 第 1/3 点）。"""
-    paths, _ = workspace
-    sources_file = paths.home / "sources.yaml"
-    sources_file.write_text(SOURCES_YAML, encoding="utf-8")
-    target = date(2026, 10, 19)
-
-    default_run = run_pipeline(
-        Settings(), paths, target_date=target, sources_file=sources_file,
-        fetcher=_FrozenFetcher({
-            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
-            ARTICLE_URL: ARTICLE,
-        }), market_client=_MiniMarket())
-    assert default_run.window_start == "2026-10-18"
-    assert default_run.window_end == "2026-10-19"
-    assert default_run.docs == [], "10-09 发布的旧文不应混进缺省日报"
-
-    only_today = run_pipeline(
-        Settings(), paths, target_date=target, sources_file=sources_file,
-        fetcher=_FrozenFetcher({
-            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
-            ARTICLE_URL: ARTICLE,
-        }), market_client=_MiniMarket(), since_days=1)
-    assert only_today.window_start == "2026-10-19", "--since 1 即只收当日，不能落回 [昨日, 今日]"
-    assert only_today.docs == []
-
-    backfill = run_pipeline(
-        Settings(), paths, target_date=target, sources_file=sources_file,
-        fetcher=_FrozenFetcher({
-            "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": _feed(),
-            ARTICLE_URL: ARTICLE,
-        }), market_client=_MiniMarket(), since_days=14)
-    assert backfill.window_start == "2026-10-06"
-    assert len(backfill.docs) == 1, "--since 14 显式补跑才收旧文"
