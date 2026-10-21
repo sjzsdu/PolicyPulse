@@ -86,6 +86,10 @@ class Signal:
     model: str = "rules-v1"
     prompt_version: str = "rules-v1"
     quote_verified: bool = False
+    # 信号级可投资性闸门：保守默认 False，由 investability.assess_signal 判定后写入。
+    # False = 泛经济样板表述，仍入库可审计，但不映射板块、不展开个股
+    investable: bool = False
+    investable_reason: str = ""
 
 
 def normalize(text: str) -> str:

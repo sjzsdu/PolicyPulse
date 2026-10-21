@@ -35,6 +35,13 @@ GATE_CAVEAT = (
     "闸门是过滤器，不是基本面判断。"
 )
 
+# 信号级可投资性闸门口径说明
+INVESTABLE_CAVEAT = (
+    "信号先过「信号级可投资性闸门」（确定性词表，不依赖 LLM）：泛经济样板表述"
+    "（如「扩大内需」「高质量发展」）且不含具名产业词的信号，不映射板块、不展开个股，"
+    "只在「非投资信号」区留一行审计记录。"
+)
+
 
 @dataclass
 class Paths:
@@ -120,6 +127,9 @@ class Settings:
     relevance_gate: bool = True
     # drop=闸门不通过直接不进正文；demote=保留入库但相关性压到最低（默认，便于审计）
     relevance_gate_mode: str = "demote"
+    # 信号级可投资性闸门：泛经济样板表述不得映射板块、不得进受益表。
+    # 关闭后所有信号按可投资处理（旧行为），但审计字段仍照常写入
+    investable_gate: bool = True
     # 全局相关性截断：低于该值的个股不进日报（取代“每板块 Top-N”）
     min_relevance: float = 0.5
     # 算力上界：单条信号最多展开多少只候选再过闸门（只影响评估量，不参与最终排序）

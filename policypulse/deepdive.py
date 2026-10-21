@@ -28,6 +28,35 @@ SKIP_INVALID = "个股深度研读已跳过：模型结论缺少可校验的溯�
 
 _REQUIRED = ("transmission", "competition", "impact")
 
+# 传导判断的确定性映射（深读结论反向分区用）。
+# 否定表述必须先判：「无直接传导」「间接情绪面」「实质业务传导有限」里都含
+# 「直接」「间接」，先判肯定词会把 APEC 那批「打脸自己」的深读重新算成实质传导。
+# CR-2：深读输出是自由文本，实测「无直接影响 / 不直接受益 / 暂未看到直接带动」
+# 三条都会先被「直接」捞成实质传导——补否定前缀，按前缀拦而非枚举完整短语。
+NO_SUBSTANCE_CUES: tuple[str, ...] = (
+    "无实质传导", "无实质", "无直接传导", "实质业务传导有限", "传导有限",
+    "关联度低", "影响有限", "缺乏具体措施", "无具体措施", "间接情绪面",
+    "间接、无实质", "仅情绪面", "中性",
+    # 否定前缀（CR-2）：「未看到直接」一条即可覆盖「暂未看到直接 / 尚未看到直接」
+    "无直接", "未直接", "不直接", "未看到直接", "暂无直接",
+)
+SUBSTANCE_CUES: tuple[str, ...] = ("直接", "间接")
+
+
+def substantive_transmission(transmission: str) -> bool | None:
+    """把 DeepDive.transmission 映射成 (是否实质传导)。
+
+    返回 True（实质传导）/ False（无实质传导）/ None（判不出来，按无深读处理）。
+    """
+    text = (transmission or "").strip()
+    if not text:
+        return None
+    if any(cue in text for cue in NO_SUBSTANCE_CUES):
+        return False
+    if any(cue in text for cue in SUBSTANCE_CUES):
+        return True
+    return None
+
 
 @dataclass
 class DeepDive:
@@ -43,6 +72,8 @@ class DeepDive:
     impact: str = ""
     risks: list[str] = field(default_factory=list)
     sources: list[dict] = field(default_factory=list)
+    # 深读结论要能反向决定它所属政策事件的报告分区，因此必须记住 event_id
+    event_id: str = ""
 
 
 def _allowed_refs(payload: dict, code: str, settings: Settings) -> set[str]:
@@ -169,5 +200,6 @@ def build_deepdives(events, client, settings: Settings, llm_fn=None) -> tuple[li
             impact=checked["impact"],
             risks=checked["risks"],
             sources=checked["sources"],
+            event_id=event.event_id,
         ))
     return dives, notes
