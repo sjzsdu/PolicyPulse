@@ -1,5 +1,5 @@
 # 可选：不想用默认值时改这里。缺省时 policypulse 用 Settings 的内置默认值。
-<# 注意：不再有 lookback_days。日报默认只看「目标日 + 前一天」，
+# 注意：不再有 lookback_days。日报默认只看「目标日 + 前一天」，
 # 要回补更早的历史请用命令行 `policypulse run --since N`（窗口 [目标日-N, 目标日]）；
 # 窗口内无新增就写「今日无新增政策/事件」，不回退抓旧稿。
 daily_window_days: 2
