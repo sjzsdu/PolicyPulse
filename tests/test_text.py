@@ -39,6 +39,24 @@ def test_publish_time_parsing():
     assert extract_publish_time("<div>no date</div>") == ""
 
 
+def test_publish_time_text_fallback_is_normalized():
+    """文本兜底分支必须和 html 分支一样归一成零填充 YYYY-MM-DD。
+
+    原来这里返回原始匹配串（`2026年10月19`），`_in_window` 是裸字符串比较，
+    `年`/`/` 的码位大于 `-` → 窗口内稿件被误杀，还被计入 out_of_window_docs。
+    """
+    assert extract_publish_time("", "会议于2026年10月19日举行") == "2026-10-19"
+    assert extract_publish_time("", "2026/10/19 发布") == "2026-10-19"
+    assert extract_publish_time("", "2026.10.19 印发") == "2026-10-19"
+    # 单位数字同样零填充
+    assert extract_publish_time("", "2026年1月9日") == "2026-01-09"
+    # 越界日期不返回原始串，按「无日期」处理（不进窗口外剔除计数）
+    assert extract_publish_time("", "2026年13月45日") == ""
+    # html 分支优先，行为不变
+    assert extract_publish_time("<div>发布时间：2026-10-09 10:00</div>",
+                                "会议于2026年10月19日举行") == "2026-10-09"
+
+
 def test_content_hash_ignores_whitespace():
     assert content_hash("低空 经济\n") == content_hash("低空经济")
     assert content_hash("甲") != content_hash("乙")

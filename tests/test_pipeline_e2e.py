@@ -187,12 +187,12 @@ def _feed_no_list_date():
                         "URL": ARTICLE_URL}], ensure_ascii=False)
 
 
-def _fetch_with_feed(workspace, feed_json, window_start, window_end):
+def _fetch_with_feed(workspace, feed_json, window_start, window_end, article=ARTICLE):
     paths, snapshot_dir = workspace
     store = Store(paths.db)
     fetcher = _FrozenFetcher({
         "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": feed_json,
-        ARTICLE_URL: ARTICLE,
+        ARTICLE_URL: article,
     })
     diag: dict = {}
     docs, failed, dupes = fetch_documents(fetcher, _specs(), Settings(), window_start,
@@ -224,3 +224,43 @@ def test_detail_page_date_inside_window_is_kept(workspace):
     assert diag["out_of_window_docs"] == 0
     assert diag["no_update"] == []
     assert failed == [] and dupes == 0
+
+
+def _long_page_with_text_date(date_text: str) -> str:
+    """前 200KB 里没有日期、正文里有的页面：日期只能走文本兜底分支。
+
+    填充块用 <style>：extract_main_text 会剥掉它，正文仍然带日期；
+    extract_publish_time 的 html 分支只看 raw html[:200000]，看不到日期。
+    """
+    pad = "#pad{color:red;padding:1px;margin:2px}\n" * 7000  # ~224KB，日期必然落在 200KB 之后
+    sentence = ("会议于" + date_text + "举行，本次会议研究了低空经济产业协同与基础设施"
+                "建设相关工作，并就下一步重点任务作出部署安排。")
+    return (
+        "<html><head><title>测试会议通知</title>"
+        f"<style>{pad}</style></head><body>"
+        f"<article><h1>测试会议通知</h1><p>{sentence * 6}</p></article>"
+        "</body></html>"
+    )
+
+
+def test_text_fallback_date_in_window_is_not_dropped(workspace):
+    """文本兜底分支的日期必须归一后再判窗：窗口内稿件不得被未归一日期误杀。"""
+    docs, failed, dupes, diag = _fetch_with_feed(
+        workspace, _feed_no_list_date(), "2026-10-19", "2026-10-20",
+        article=_long_page_with_text_date("2026年10月19日"))
+    assert len(docs) == 1, "窗口内稿件不得被文本分支的未归一日期误杀"
+    assert docs[0].published_at == "2026-10-19", "文本兜底分支也要归一成 YYYY-MM-DD"
+    assert diag["out_of_window_docs"] == 0, "误杀不能混进真剔除的计数"
+    assert diag["no_update"] == []
+    assert failed == [] and dupes == 0
+
+
+def test_text_fallback_date_out_of_window_is_still_dropped(workspace):
+    """对照组：文本兜底分支取到的窗口外日期照常剔除并计数。"""
+    docs, failed, dupes, diag = _fetch_with_feed(
+        workspace, _feed_no_list_date(), "2026-10-19", "2026-10-20",
+        article=_long_page_with_text_date("2026年10月14日"))
+    assert docs == [], "文本分支取到的 2026-10-14 在窗口外，不得入库"
+    assert failed == [] and dupes == 0, "抓取本身成功，只是被窗口口径剔除"
+    assert diag["out_of_window_docs"] == 1, "归一后的窗口外日期照常计入真剔除"
+    assert diag["no_update"] == ["gov_zhengce"]
