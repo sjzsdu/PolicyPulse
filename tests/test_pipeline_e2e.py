@@ -179,3 +179,48 @@ def test_out_of_window_documents_are_not_fetched(workspace):
     assert diag["discovered"] == ["gov_zhengce"]
     assert diag["no_update"] == ["gov_zhengce"]
     store.close()
+
+
+def _feed_no_list_date():
+    """列表页不带日期：商务部 xwfb 一类栏目就是这样，靠详情页日期兜底。"""
+    return json.dumps([{"TITLE": "中共中央 国务院关于发展新质生产力的意见",
+                        "URL": ARTICLE_URL}], ensure_ascii=False)
+
+
+def _fetch_with_feed(workspace, feed_json, window_start, window_end):
+    paths, snapshot_dir = workspace
+    store = Store(paths.db)
+    fetcher = _FrozenFetcher({
+        "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json": feed_json,
+        ARTICLE_URL: ARTICLE,
+    })
+    diag: dict = {}
+    docs, failed, dupes = fetch_documents(fetcher, _specs(), Settings(), window_start,
+                                          window_end, snapshot_dir, "run-test", store, diag)
+    store.close()
+    return docs, failed, dupes, diag
+
+
+def test_detail_page_date_out_of_window_is_dropped(workspace):
+    """列表页无日期时，详情页日期必须再判一次窗口。
+
+    商务部 xwfb 列表页解析不出日期 → 旧实现绕过窗口过滤 → 10-14 的旧稿
+    进了「10-19 ~ 10-20」的当日日报。现在要剔除并计入 out_of_window_docs。
+    """
+    docs, failed, dupes, diag = _fetch_with_feed(workspace, _feed_no_list_date(),
+                                                 "2026-10-19", "2026-10-20")
+    assert docs == [], f"详情页日期 2026-10-09 落在窗口外，不得入库：{docs}"
+    assert failed == [] and dupes == 0, "抓取本身成功，只是被窗口口径剔除"
+    assert diag["out_of_window_docs"] == 1, "窗口外的稿子必须计数，不能静默丢弃"
+    assert diag["no_update"] == ["gov_zhengce"], "全部候选都被剔除 = 该源窗口内无更新"
+
+
+def test_detail_page_date_inside_window_is_kept(workspace):
+    """对照组：详情页日期在窗口内时照常入库，out_of_window_docs 归零。"""
+    docs, failed, dupes, diag = _fetch_with_feed(workspace, _feed_no_list_date(),
+                                                 "2026-10-06", "2026-10-19")
+    assert len(docs) == 1, "详情页日期 2026-10-09 在窗口内，应当入库"
+    assert docs[0].published_at == "2026-10-09", "入库日期取详情页日期"
+    assert diag["out_of_window_docs"] == 0
+    assert diag["no_update"] == []
+    assert failed == [] and dupes == 0

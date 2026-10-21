@@ -156,6 +156,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
     diag = diagnostics if diagnostics is not None else {}
     discovered: list[str] = diag.setdefault("discovered", [])
     no_update: list[str] = diag.setdefault("no_update", [])
+    out_of_window_docs: int = diag.setdefault("out_of_window_docs", 0)
 
     for spec in specs:
         if not spec.enabled:
@@ -198,6 +199,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
         if items and not picked:
             no_update.append(spec.id)
 
+        dropped_out_of_window = 0
         for item in picked:
             try:
                 # 本地 inbound 源不经过网络：适配器自己提供正文
@@ -216,6 +218,12 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
             if len(body) < min_body:
                 continue
             published = item.published_at or extract_publish_time(html, body)
+            # 列表页没给日期的源（如商务部 xwfb）会绕过上面的窗口过滤，
+            # 详情页日期在这里必须再判一次窗口，否则 10-14 的旧稿照进当日日报。
+            if not _in_window(published, window_start, window_end):
+                dropped_out_of_window += 1
+                diag["out_of_window_docs"] += 1
+                continue
 
             digest = content_hash(body)
             # 原文指纹取可见文本：忽略脚本注入的计数器/时间戳噪声
@@ -250,6 +258,9 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                 snapshot_path=str(snap),
                 body=body,
             ))
+        # 候选全被详情页日期判到窗口外 = 该源窗口内确实没有更新，如实记入 no_update
+        if picked and dropped_out_of_window == len(picked):
+            no_update.append(spec.id)
     _emit_warnings(fetcher, warnings)
     return docs, failed, duplicates_skipped
 
@@ -521,6 +532,7 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "local_inbound_sources": len(specs) - len(net_source_ids),
         "fetch_failures": len(failed),
         "duplicates_skipped": duplicates,
+        "out_of_window_docs": diagnostics.get("out_of_window_docs", 0),
         "gate": gate_stats,
         "deepdive_count": len(dives),
         # 央行相关内容条数与来源：WAN-10 的验收要能指认

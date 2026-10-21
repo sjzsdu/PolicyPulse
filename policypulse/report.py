@@ -88,6 +88,7 @@ def render_markdown(result: RunResult) -> str:
     lines.append(f"| 信息源（可用/总数） | {s.get('sources_ok', 0)} / {s['sources_total']} |")
     lines.append(f"| 抓取失败条目 | {s.get('fetch_failures', 0)} |")
     lines.append(f"| 跨 run 去重跳过 | {s.get('duplicates_skipped', 0)} |")
+    lines.append(f"| 窗口外剔除（详情页日期） | {s.get('out_of_window_docs', 0)} |")
     lines.append(f"| 公司级相关性闸门 | {_gate_line(s.get('gate', {}))} |")
     lines.append(f"| 个股深度研读 | {s.get('deepdive_count', 0)} 条 |")
     lines.append(f"| LLM 抽取 | {'开启' if s['llm_enabled'] else '关闭（规则抽取）'} |")
@@ -112,6 +113,11 @@ def render_markdown(result: RunResult) -> str:
 
     if result.duplicates_skipped:
         lines.append(f"- 另有 {result.duplicates_skipped} 篇文档正文指纹已在库（跨 run 去重），本次未重复抽取。")
+        lines.append("")
+    out_window = s.get("out_of_window_docs", 0)
+    if out_window:
+        lines.append(f"- {out_window} 篇文档的详情页发布日期落在统计窗口外，已剔除"
+                     "（列表页无日期的源靠详情页日期兜底判定，不进当日日报）。")
         lines.append("")
     no_update = s.get("sources_no_update") or []
     if no_update:
