@@ -324,7 +324,8 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
             # 信号级可投资性闸门：确定性词表判定，在板块匹配与个股展开之前。
             # 非投资信号仍入库（可审计），但不映射板块、不展开个股，
             # 并清掉历史 run 遗留的展开行——否则「受益」表里还留着旧个股
-            sig.investable, sig.investable_reason = assess_signal(sig, settings, business_map)
+            sig.investable, sig.investable_reason = assess_signal(
+                sig, settings, business_map, alias_map)
             store.upsert_signal(sig, run_id)
             all_signals.append(sig)
 

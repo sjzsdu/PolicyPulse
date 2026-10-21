@@ -111,7 +111,12 @@ def cmd_show(args) -> int:
     print(f"引用: {sig['quote']}  [子串校验: {'通过' if sig['quote_verified'] else '未通过'}]")
     print(f"主题: {sig['theme_tags']}  工具: {sig['instruments']}  周期: {sig['horizon']}  性质: {sig['novelty']}")
     # 信号级可投资性闸门：历史行不回填，展示层按当前词表实时判定，可复核词表口径
-    ok, reason = assess_text(f"{sig['summary']}{sig['quote']}", load_settings())
+    try:
+        theme_tags = json.loads(sig["theme_tags"] or "[]")
+    except (TypeError, ValueError):
+        theme_tags = []
+    ok, reason = assess_text(f"{sig['summary']}{sig['quote']}", load_settings(),
+                             theme_tags=theme_tags)
     print(f"可投资性: {'是' if ok else '否'} —— {reason}")
     stored = sig["investable"]
     if stored is None:

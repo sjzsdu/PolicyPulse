@@ -51,7 +51,8 @@ def build_conclusions_from_store(store: Store, run_id: str, settings) -> tuple[l
     signals, conclusions = [], []
     for row in store.signals_for_run(run_id):
         doc = store.document(row["doc_id"])
-        ok, reason = assess_text(f"{row['summary']}{row['quote']}", settings)
+        ok, reason = assess_text(f"{row['summary']}{row['quote']}", settings,
+                                 theme_tags=_loads(row["theme_tags"], []))
         signals.append({"signal_id": row["signal_id"], "investable": ok, "reason": reason})
 
         rows = store.tickers_for_signal(row["signal_id"]) if ok else []

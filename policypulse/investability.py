@@ -12,13 +12,20 @@
 2. 信号文本（summary + quote）里不含任何具名产业 / 具体项目词
    → `investable=False`，该信号仍入库可审计，但**跳过板块匹配与个股展开**。
 
+CR-1 补丁（同义改写穿网，例：「大力提振内需，扩大居民消费，培育消费新业态」不含任何
+样板短语却照样被 alias「内需 → 新零售」带进受益表）：判定再加一层**主题证据校验**——
+3. 信号的 theme_tags 若只由「泛 alias」命中、原文又不含该主题的具名证据
+   （theme_business 业务词 / 具名 alias / 主题名本身）→ 判非投资。
+   这样「扩大国内需求」与「提振内需」两种写法都被拦，而真消费政策（含「零售 / 门店」等
+   业务词，或「免税」等具名 alias）自然放行；不扩 denylist，跷跷板只往安全一侧偏。
+
 判定不确定时（既无样板词也无具名产业词）按需求文档归为可投资；
 `Signal.investable` 字段本身保守默认 False，只有判定通过后才写 True。
 """
 
 from __future__ import annotations
 
-from policypulse.config import Settings, load_theme_business
+from policypulse.config import Settings, load_theme_alias, load_theme_business
 
 # 泛经济样板词：出现在任何一篇通稿里都不构成「具体产业 / 具体项目 / 量化措施」。
 # 词表刻意只收「换个会议也能原样套用」的表述，避免把真政策误杀成非投资。
@@ -41,6 +48,17 @@ GENERIC_POLICY_MARKERS: tuple[str, ...] = (
     "稳增长",
     "提质增效",
     "行稳致远",
+)
+
+# 具体政策项目名：有明确落点的白名单词（与上面 denylist 的样板词方向相反）。
+# CR 反例里「首发经济 / 老旧小区改造 / 县域商业体系 / 以旧换新」只因不在词表内，
+# 就被「扩大国内需求」这类样板词连坐判非投资——这类具名项目必须放行。
+# 放进白名单只会少拦，不会多拦，无跷跷板风险（denylist 扩词才有）。
+CONCRETE_PROGRAM_WORDS: tuple[str, ...] = (
+    "首发经济", "首店经济",
+    "老旧小区改造", "城镇老旧小区改造",
+    "县域商业体系", "以旧换新", "消费品以旧换新",
+    "设备更新", "大规模设备更新",
 )
 
 # 具名产业 / 具体领域词：命中任意一个即认为信号有落点，不判非投资。
@@ -70,7 +88,7 @@ NAMED_INDUSTRY_WORDS: tuple[str, ...] = (
     "专项债", "超长期特别国债", "转移支付", "结构性减税", "留抵退税",
     "普惠金融", "科技金融", "绿色金融", "养老金融", "数字金融",
     "全国统一大市场", "负面清单", "市场准入",
-)
+) + CONCRETE_PROGRAM_WORDS
 
 _MIN_TERM_LEN = 2
 
@@ -103,17 +121,85 @@ def assess_investable(text: str, terms: tuple[str, ...] | None = None) -> tuple[
     return False, f"命中泛样板表述「{markers[0]}」且无具名产业词"
 
 
+# 泛需求措辞：只表达「要扩内需 / 要促消费」这种宏观意愿的表述（CR-1）。
+# 前一组来自 theme_alias.csv 的原始泛 alias（内需/促消费/消费新业态/商圈 → 新零售，
+# 消费升级 → 白酒概念）；后一组是**同义改写族**——通稿与模型输出同样会这么写，
+# 但不在 csv 里，例：「大力提振内需，扩大居民消费」漏判实测就靠它穿网。
+# 取舍：不把它们加进 denylist（GENERIC_POLICY_MARKERS），只用来做「主题证据不足」的
+# 判据，因此不会连坐「大规模设备更新和消费品以旧换新」这类带具名落点的真消费政策。
+GENERIC_THEME_ALIASES: frozenset[str] = frozenset({
+    # theme_alias.csv 原始泛 alias
+    "内需", "促消费", "消费新业态", "商圈", "消费升级",
+    # 同义改写族（CR-1 漏判实测穿网句）
+    "提振内需", "扩内需", "扩大内需", "扩大国内需求", "扩大居民消费",
+    "提振消费", "扩大消费", "释放消费潜力", "消费扩容提质", "培育消费新业态",
+})
+
+
+def theme_evidence(text: str, theme_tags, alias_map: dict[str, list[str]] | None = None,
+                   business_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
+    """主题证据校验（CR-1 路线 b）：主题是否只由泛需求措辞支撑且原文无具名证据。
+
+    返回 (ok, 依据)。ok=False 表示信号的主题无法用原文证据支撑 → 判非投资。
+    无主题标签、或任一主题有具名证据（主题名本身 / 具名 alias / 业务词）时返回 True。
+    """
+    tags = [str(t).strip() for t in (theme_tags or []) if str(t).strip()]
+    if not tags:
+        return True, "无主题标签，跳过主题证据校验"
+    alias_map = alias_map if alias_map is not None else load_theme_alias()
+    business_map = business_map if business_map is not None else load_theme_business()
+    for theme in tags:
+        if theme in text:
+            return True, f"原文含主题名「{theme}」"
+        aliases = alias_map.get(theme) or []
+        named = [a for a in aliases
+                 if a not in GENERIC_THEME_ALIASES and len(a) >= _MIN_TERM_LEN and a in text]
+        if named:
+            return True, f"命中具名 alias「{named[0]}」（主题 {theme}）"
+        biz = [w.strip() for w in (business_map.get(theme) or [])
+               if len(w.strip()) >= _MIN_TERM_LEN and w.strip() in text]
+        if biz:
+            return True, f"命中业务词「{biz[0]}」（主题 {theme}）"
+    phrases = sorted((p for p in GENERIC_THEME_ALIASES if p in text), key=lambda p: -len(p))
+    if phrases:
+        return False, (f"主题「{'、'.join(tags)}」在原文无具名证据"
+                       f"（业务词 / 具名 alias），仅命中泛需求措辞「{phrases[0]}」")
+    return True, "主题未被泛需求措辞唯一支撑，不做证据降级"
+
+
 def assess_text(text: str, settings: Settings | None = None,
-                business_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
-    """对一段信号文本做带开关的判定（入库行、CLI 展示共用同一入口）。"""
+                business_map: dict[str, list[str]] | None = None,
+                theme_tags=None,
+                alias_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
+    """对一段信号文本做带开关的判定（入库行、CLI 展示共用同一入口）。
+
+    顺序：具名产业词 → 主题证据校验（CR-1）→ 泛样板词兜底。
+    """
     settings = settings or Settings()
     if not settings.investable_gate:
         return True, "信号级可投资性闸门已关闭（investable_gate=false）"
-    return assess_investable(text, named_industry_terms(business_map))
+    text = text or ""
+    terms = named_industry_terms(business_map)
+    markers = [m for m in GENERIC_POLICY_MARKERS if m in text]
+    named_hits = [t for t in terms if t in text]
+    if named_hits:
+        joined = "、".join(named_hits[:3])
+        if markers:
+            return True, f"命中泛样板表述「{markers[0]}」，但含具名产业词「{joined}」"
+        return True, f"含具名产业词「{joined}」"
+    ok, reason = theme_evidence(text, theme_tags, alias_map, business_map)
+    if not ok:
+        return False, reason
+    if markers:
+        return False, f"命中泛样板表述「{markers[0]}」且无具名产业词"
+    return True, "未命中泛经济样板表述"
 
 
 def assess_signal(sig, settings: Settings | None = None,
-                  business_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
+                  business_map: dict[str, list[str]] | None = None,
+                  alias_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
     """判定一条信号是否可投资。闸门开关关闭时一律放行（并如实写明）。"""
     text = f"{getattr(sig, 'summary', '')}{getattr(sig, 'quote', '')}"
-    return assess_text(text, settings, business_map)
+    return assess_text(text, settings, business_map,
+                       theme_tags=list(getattr(sig, "theme_tags", None) or []),
+                       alias_map=alias_map)

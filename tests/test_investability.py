@@ -20,9 +20,11 @@ from policypulse.deepdive import DeepDive, substantive_transmission
 from policypulse.extract import Signal
 from policypulse.investability import (
     GENERIC_POLICY_MARKERS,
+    GENERIC_THEME_ALIASES,
     assess_investable,
     assess_signal,
     assess_text,
+    theme_evidence,
 )
 from policypulse.pipeline import DocRecord, RunResult, build_conclusions
 from policypulse.report import (
@@ -181,13 +183,23 @@ def test_non_investable_signal_never_enters_bullish_table(tmp_path):
 def test_substantive_transmission_mapping_is_deterministic():
     """否定表述先判：「无直接传导 / 间接情绪面 / 实质业务传导有限」里都含「直接」「间接」。"""
     no_substance = ["中性", "无实质传导", "无直接传导", "间接情绪面", "间接、无实质",
-                    "实质业务传导有限", "关联度低", "影响有限", "缺乏具体措施", "仅情绪面"]
+                    "实质业务传导有限", "关联度低", "影响有限", "缺乏具体措施", "仅情绪面",
+                    # CR-2：否定前缀，不再依赖完整短语枚举
+                    "无直接影响", "不直接受益", "暂未看到直接带动"]
     for text in no_substance:
         assert substantive_transmission(text) is False, f"应判无实质传导：{text}"
     for text in ["直接传导", "政策直接利好", "间接传导", "以间接方式受益"]:
         assert substantive_transmission(text) is True, f"应判实质传导：{text}"
     assert substantive_transmission("") is None
     assert substantive_transmission("   ") is None
+
+
+def test_negation_prefixes_beat_substance_cues():
+    """CR-2 复现实测三条：只含「直接」二字的否定镜像措辞必须判无实质。"""
+    for text in ("无直接影响", "不直接受益", "暂未看到直接带动", "未看到直接带动效应"):
+        assert substantive_transmission(text) is False, f"否定前缀被「直接」捞成实质：{text}"
+    # 肯定表述不受影响
+    assert substantive_transmission("政策直接利好公司主业") is True
 
 
 def _event_section_of(conclusions, transmissions):
@@ -242,6 +254,11 @@ def test_deepdive_verdict_decides_the_event_section():
     # 多数决：2 条无实质 + 1 条实质 → 降级
     assert _event_section_of([_bullish_conclusion()],
                              ["无实质传导", "中性", "直接传导"]) == SECTION_CONCEPT_ONLY
+    # 平局（1 实质 vs 1 无实质）也降级：宁可空着也不编
+    assert _event_section_of([_bullish_conclusion()],
+                             ["直接传导", "无实质传导"]) == SECTION_CONCEPT_ONLY
+    assert _event_section_of([_bullish_conclusion()],
+                             ["无直接影响", "直接传导"]) == SECTION_CONCEPT_ONLY
 
 
 def test_all_non_investable_event_is_not_investable_section():
@@ -400,3 +417,63 @@ def test_empty_bullish_day_is_stated_on_all_three_ends():
     assert payload["sections"]["受益个股"] == []
     assert payload["sections"]["仅概念关联"], "降级事件仍要留痕"
     assert all(e["section"] != SECTION_BULLISH for e in payload["events"])
+
+
+# ---- CR-1：主题证据校验（同义改写漏判 + 具名项目误杀，双向验证） ----
+
+
+def _signal(text: str, themes: list[str]) -> Signal:
+    return Signal(summary=text[:40], quote=text, theme_tags=themes)
+
+
+def test_synonym_rewrite_of_generic_boilerplate_is_blocked():
+    """CR-1 漏判侧：评审实测的三种同义改写必须判非投资（不再只认 18 条样板短语）。"""
+    rewrites = [
+        "会议进一步强调要大力提振内需，扩大居民消费，培育消费新业态新模式，巩固经济恢复发展基础。",
+        "会议指出要释放消费潜力，扩内需稳增长，巩固经济回升向好基础。",
+        "促进消费扩容提质，更好发挥消费对经济发展的基础性作用。",
+    ]
+    for text in rewrites:
+        ok, reason = assess_signal(_signal(text, ["新零售"]))
+        assert ok is False, f"泛需求同义改写必须判非投资：{text} → {reason}"
+        assert "泛需求措辞" in reason and "具名证据" in reason
+        # 老的样板短语路径也不受影响
+        assert assess_signal(_signal(APEC_TEXT, ["新零售"]))[0] is False
+
+
+def test_theme_evidence_accepts_named_evidence():
+    """路线 (b) 的放行侧：业务词 / 具名 alias / 主题名本身都算具名证据。"""
+    assert theme_evidence("促进消费扩容提质，加快零售数字化改造", ["新零售"])[0] is True
+    assert theme_evidence("大力发展离岛免税，做大免税消费回流", ["免税概念"])[0] is True
+    assert theme_evidence("会议提到新零售业态创新。", ["新零售"])[0] is True
+    assert theme_evidence("会议强调扩大内需。", ["新零售"])[0] is False
+    assert theme_evidence("会议强调扩大内需。", [])[0] is True  # 无主题不做证据降级
+
+
+def test_generic_alias_set_is_not_a_named_channel():
+    """泛需求措辞集只收 macro 措辞：具名渠道 alias 不得被当成泛化。"""
+    assert "内需" in GENERIC_THEME_ALIASES and "消费新业态" in GENERIC_THEME_ALIASES
+    assert "免税" not in GENERIC_THEME_ALIASES and "离岛免税" not in GENERIC_THEME_ALIASES
+
+
+def test_concrete_program_words_are_not_killed():
+    """CR-1 误杀侧：具名政策项目不得被样板词连坐（含评审给的合并反例）。"""
+    cases = [
+        ("大力发展首发经济，支持国际品牌在华设立首店。", ["新零售"]),
+        ("加大城镇老旧小区改造力度，完善配套基础设施。", ["新型城镇"]),
+        ("健全县域商业体系，推动物流配送下乡。", ["新零售"]),
+        ("推动大规模设备更新和消费品以旧换新，中央财政按比例给予补贴。", ["新零售"]),
+        ("着力扩大国内需求，提振消费，大力发展首发经济、加大老旧小区改造力度、健全县域商业体系。",
+         ["新零售"]),
+    ]
+    for text, themes in cases:
+        ok, reason = assess_signal(_signal(text, themes))
+        assert ok is True, f"具名项目被误杀：{text} → {reason}"
+
+
+def test_empty_theme_signal_falls_back_to_marker_rule():
+    """设计边界：无主题标签时不做证据降级，仍交给样板词规则兜底。"""
+    ok, reason = assess_signal(_signal("促进消费扩容提质，夯实发展基础。", []))
+    assert ok is True and "未命中泛经济样板表述" in reason
+    ok2, reason2 = assess_signal(_signal("会议强调扩大内需，坚定不移完成目标。", []))
+    assert ok2 is False and "泛样板" in reason2

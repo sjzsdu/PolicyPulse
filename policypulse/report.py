@@ -84,8 +84,10 @@ def _event_section(ev, verdicts_by_event: dict[str, list[bool]]) -> str:
     """深读结论反向决定事件分区。
 
     - 没有可投资信号 → 非投资信号（改动 1，词表闸门已判定）
-    - 有深读且全部/多数判「无实质传导」→ 仅概念关联（改动 2，不再授予受益头衔）
-    - 有深读且多数判实质传导 → 受益个股
+    - 有深读且无实质传导占多数**或打平**→ 仅概念关联（改动 2，不再授予受益头衔）
+      平局也降级：项目红线是「宁可空着也不编」，1 实质 vs 1 无实质时留在「受益」
+      等于替这条实质结论兜底整件事（CR 备注项，顺手改掉）
+    - 有深读且实质传导明显占多数 → 受益个股
     - 没有深读（未配 LLM）→ 保持现有行为仍进受益区，但明确标注未做传导判定
     """
     if not [c for c in ev.conclusions if c.get("investable", True)]:
@@ -93,7 +95,7 @@ def _event_section(ev, verdicts_by_event: dict[str, list[bool]]) -> str:
     verdicts = verdicts_by_event.get(ev.event_id) or []
     if verdicts:
         no_substance = sum(1 for v in verdicts if not v)
-        if no_substance * 2 > len(verdicts):
+        if no_substance * 2 >= len(verdicts):
             return SECTION_CONCEPT_ONLY
         return SECTION_BULLISH
     return SECTION_CONCEPT_PENDING
