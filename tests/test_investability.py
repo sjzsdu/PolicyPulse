@@ -1,9 +1,12 @@
 """信号级可投资性闸门（改动 1）与深读结论反向分区（改动 2 / 3）的离线单测。
 
-对应 `docs/iteration-prompt-001.md` 验收第 1、2 条：
+对应 `docs/iteration-prompt-001.md` 验收第 1、2 条 + WAN-15 语义判定改造：
 - 样板话信号 → `investable=False`、不映射板块、不展开个股、不进「受益」表；
 - 具名产业信号 → 保留；
-- `transmission` 判「中性 / 无实质传导」→ 事件降级「仅概念关联」，判「直接 / 间接」→「受益个股」；
+- 受益主体明确性（LLM 语义判定）「无受益链条」→ 非投资；「有产业方向但无具体主体」
+  /「有明确受益主体」→ 交回下游；
+- 深读分区只认结构化 `substantive` 枚举（是/否/不确定），「否」/打平 →「仅概念关联」，
+  明确「是」→「受益个股」，无判定 →「概念关联（未做实质传导判定）」；
 - md / html / json 三端分区一致。
 
 全程离线：不碰网络、不碰 tongstock、不调 LLM。
@@ -16,11 +19,20 @@ import re
 
 from policypulse.clustering import cluster_events
 from policypulse.config import Settings, load_theme_alias
-from policypulse.deepdive import DeepDive, substantive_transmission
+from policypulse.deepdive import (
+    SUBSTANTIVE_NO,
+    SUBSTANTIVE_UNCERTAIN,
+    SUBSTANTIVE_YES,
+    DeepDive,
+    substantive_verdict,
+)
 from policypulse.extract import Signal
 from policypulse.investability import (
     GENERIC_POLICY_MARKERS,
     GENERIC_THEME_ALIASES,
+    SPECIFICITY_DIRECTIONAL,
+    SPECIFICITY_NAMED,
+    SPECIFICITY_NONE,
     assess_investable,
     assess_signal,
     assess_text,
@@ -180,40 +192,34 @@ def test_non_investable_signal_never_enters_bullish_table(tmp_path):
 # ---- 改动 2：深读结论反向分区 ----
 
 
-def test_substantive_transmission_mapping_is_deterministic():
-    """否定表述先判：「无直接传导 / 间接情绪面 / 实质业务传导有限」里都含「直接」「间接」。"""
-    no_substance = ["中性", "无实质传导", "无直接传导", "间接情绪面", "间接、无实质",
-                    "实质业务传导有限", "关联度低", "影响有限", "缺乏具体措施", "仅情绪面",
-                    # CR-2：否定前缀，不再依赖完整短语枚举
-                    "无直接影响", "不直接受益", "暂未看到直接带动"]
-    for text in no_substance:
-        assert substantive_transmission(text) is False, f"应判无实质传导：{text}"
-    for text in ["直接传导", "政策直接利好", "间接传导", "以间接方式受益"]:
-        assert substantive_transmission(text) is True, f"应判实质传导：{text}"
-    assert substantive_transmission("") is None
-    assert substantive_transmission("   ") is None
+def test_substantive_verdict_consumes_structured_enum_only():
+    """WAN-15：分区判定只认 LLM 的结构化 substantive 枚举，不做自由文本匹配。
+
+    旧实现扫 transmission 文本（含「间接」→ 实质），中—东联委会那批
+    「间接 + 影响有限」的深读被放行成受益——现在语义判定在 LLM 侧完成，
+    代码只消费「是 / 否 / 不确定」三个枚举值。
+    """
+    assert substantive_verdict(SUBSTANTIVE_YES) is True
+    assert substantive_verdict(SUBSTANTIVE_NO) is False
+    # 未给出 / 不可识别 → None（fail-closed：不升级为受益）
+    for value in ("", "   ", SUBSTANTIVE_UNCERTAIN, "直接影响", "间接传导", "yes", "否（影响有限）"):
+        assert substantive_verdict(value) is None, f"不可识别的值不得被猜成实质：{value!r}"
 
 
-def test_negation_prefixes_beat_substance_cues():
-    """CR-2 复现实测三条：只含「直接」二字的否定镜像措辞必须判无实质。"""
-    for text in ("无直接影响", "不直接受益", "暂未看到直接带动", "未看到直接带动效应"):
-        assert substantive_transmission(text) is False, f"否定前缀被「直接」捞成实质：{text}"
-    # 肯定表述不受影响
-    assert substantive_transmission("政策直接利好公司主业") is True
-
-
-def _event_section_of(conclusions, transmissions):
+def _event_section_of(conclusions, deepdive_specs):
+    """deepdive_specs: [(transmission, impact, substantive)] → 事件分区。"""
     events = cluster_events(conclusions)
     deepdives = [DeepDive(
         ticker_code="601888", ticker_name="中国中免", policy_title="政策",
         policy_summary="摘要", policy_quote="引用", policy_url="https://www.gov.cn/a.htm",
-        profile_business="免税零售", transmission=t, competition="竞争", impact="影响",
+        profile_business="免税零售", transmission=t, competition="竞争", impact=impact,
+        substantive=substantive,
         risks=["风险"], sources=[{"label": "政策原文", "ref": "https://www.gov.cn/a.htm"}],
         event_id=events[0].event_id,
-    ) for t in transmissions]
+    ) for t, impact, substantive in deepdive_specs]
     verdicts = {}
     for d in deepdives:
-        verdict = substantive_transmission(d.transmission)
+        verdict = substantive_verdict(d.substantive)
         if verdict is not None:
             verdicts.setdefault(d.event_id, []).append(verdict)
     return _event_section(events[0], verdicts)
@@ -243,29 +249,74 @@ def _bullish_conclusion(signal_id: str = "doc-bull#1", doc_id: str = "doc-bull")
 
 
 def test_deepdive_verdict_decides_the_event_section():
-    """验收第 2 条的分区单测：无实质 → 仅概念关联；直接/间接 → 受益个股。"""
-    assert _event_section_of([_bullish_conclusion()], ["中性"]) == SECTION_CONCEPT_ONLY
-    assert _event_section_of([_bullish_conclusion()], ["无实质传导"]) == SECTION_CONCEPT_ONLY
-    assert _event_section_of([_bullish_conclusion()], ["实质业务传导有限"]) == SECTION_CONCEPT_ONLY
-    assert _event_section_of([_bullish_conclusion()], ["直接传导"]) == SECTION_BULLISH
-    assert _event_section_of([_bullish_conclusion()], ["间接传导"]) == SECTION_BULLISH
+    """验收第 2 条的分区单测：实质判定「否」→ 仅概念关联；明确「是」→ 受益个股。"""
+    assert _event_section_of([_bullish_conclusion()],
+                             [("中性", "无具体落点", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "无实质传导", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "订单落地", SUBSTANTIVE_YES)]) == SECTION_BULLISH
+    assert _event_section_of([_bullish_conclusion()],
+                             [("间接", "构成间接情绪面利好，但无具体项目", SUBSTANTIVE_YES)]) == SECTION_BULLISH
     # 没配 LLM（无深读）：保持现有行为，但不授予「受益」头衔
     assert _event_section_of([_bullish_conclusion()], []) == SECTION_CONCEPT_PENDING
-    # 多数决：2 条无实质 + 1 条实质 → 降级
+    # 多数决：2 条「否」+ 1 条「是」→ 降级
     assert _event_section_of([_bullish_conclusion()],
-                             ["无实质传导", "中性", "直接传导"]) == SECTION_CONCEPT_ONLY
-    # 平局（1 实质 vs 1 无实质）也降级：宁可空着也不编
+                             [("间接", "影响有限", SUBSTANTIVE_NO),
+                              ("中性", "无具体措施", SUBSTANTIVE_NO),
+                              ("直接", "明确订单", SUBSTANTIVE_YES)]) == SECTION_CONCEPT_ONLY
+    # 平局（1「是」 vs 1「否」）也降级：宁可空着也不编
     assert _event_section_of([_bullish_conclusion()],
-                             ["直接传导", "无实质传导"]) == SECTION_CONCEPT_ONLY
+                             [("直接", "明确订单", SUBSTANTIVE_YES),
+                              ("直接", "无具体项目指向，影响有限", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+    # 「不确定」/缺失不参与表决，但也绝不被 transmission 文本猜成升级依据
     assert _event_section_of([_bullish_conclusion()],
-                             ["无直接影响", "直接传导"]) == SECTION_CONCEPT_ONLY
+                             [("直接", "尚在评估", SUBSTANTIVE_UNCERTAIN)]) == SECTION_CONCEPT_PENDING
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "尚在评估", "")]) == SECTION_CONCEPT_PENDING
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "明确订单", SUBSTANTIVE_YES),
+                              ("间接", "待观察", SUBSTANTIVE_UNCERTAIN)]) == SECTION_BULLISH
+
+
+def test_wan15_transmission_alone_never_upgrades():
+    """WAN-15 根因回归：transmission 写「直接/间接」但 substantive 判「否」→ 必须降级。
+
+    改前实现只扫 transmission 文本（含「间接」→ 实质），中—东联委会那批
+    「间接 + 影响有限 / 无具体项目 / 无直接可验证」的深读被放行成「受益个股」。
+    """
+    # 中色股份式：间接 + 未提及具体项目 → 否 → 仅概念关联
+    assert _event_section_of([_bullish_conclusion()],
+                             [("间接", "未提及具体项目，传导有限", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+    # 怡亚通式：间接 + 无直接可验证影响 → 否
+    assert _event_section_of([_bullish_conclusion()],
+                             [("间接", "无直接可验证影响", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+    # 中工国际式：间接 + 无具体项目指向 → 否
+    assert _event_section_of([_bullish_conclusion()],
+                             [("间接", "无具体项目指向，影响有限", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+    # 即便 transmission 写「直接」，impact 否定性判断同样降级
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "难以验证的实际拉动，暂无披露", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
+
+
+def test_deepdive_positive_verdicts_still_upgrade():
+    """正向对照：真·明确订单 / 额度 / 试点的深读不能被焊死成永远不升级。"""
+    positives = [
+        ("直接", "已签订 50 亿元成套设备出口合同，订单本年度确认收入", SUBSTANTIVE_YES),
+        ("直接", "获下达可再生能源补贴额度 12 亿元，明确由公司结算", SUBSTANTIVE_YES),
+        ("间接", "纳入首批试点名单，预计将显著拉动出货量", SUBSTANTIVE_YES),
+        ("直接", "政策直接受益，主营业务订单弹性放大", SUBSTANTIVE_YES),
+    ]
+    for spec in positives:
+        assert _event_section_of([_bullish_conclusion()], [spec]) == SECTION_BULLISH, \
+            f"正向深读不得被降级：{spec}"
 
 
 def test_all_non_investable_event_is_not_investable_section():
     c = _bullish_conclusion()
     c["investable"] = False
     c["tickers"] = []
-    assert _event_section_of([c], ["直接传导"]) == SECTION_NON_INVESTABLE
+    assert _event_section_of([c], [("直接", "订单落地", SUBSTANTIVE_YES)]) == SECTION_NON_INVESTABLE
 
 
 # ---- 改动 3：md / html / json 三端分区一致 ----
@@ -316,13 +367,13 @@ def _mixed_result() -> RunResult:
         DeepDive(ticker_code="601888", ticker_name="中国中免", policy_title="政策",
                  policy_summary="摘要", policy_quote="引用", policy_url="https://www.gov.cn/a.htm",
                  profile_business="免税零售", transmission="政策直接利好", competition="竞争",
-                 impact="影响", risks=["风险"],
+                 impact="订单弹性放大", substantive=SUBSTANTIVE_YES, risks=["风险"],
                  sources=[{"label": "政策原文", "ref": "https://www.gov.cn/a.htm"}],
                  event_id=by_doc["doc-bull"].event_id),
         DeepDive(ticker_code="600415", ticker_name="小商品城", policy_title="政策",
                  policy_summary="摘要", policy_quote="引用", policy_url="https://www.mofcom.gov.cn/b.htm",
                  profile_business="小商品批发", transmission="无实质传导", competition="竞争",
-                 impact="影响", risks=["风险"],
+                 impact="无具体项目指向，影响有限", substantive=SUBSTANTIVE_NO, risks=["风险"],
                  sources=[{"label": "政策原文", "ref": "https://www.mofcom.gov.cn/b.htm"}],
                  event_id=by_doc["doc-concept"].event_id),
     ]
@@ -410,7 +461,7 @@ def test_empty_bullish_day_is_stated_on_all_three_ends():
     r = _mixed_result()
     # 把两个真信号事件也降级 / 判非投资 → 受益区必须明确「今日无实质投资信号」
     for d in r.deepdives:
-        d.transmission = "无实质传导"
+        d.substantive = SUBSTANTIVE_NO
     md, payload, html = render_markdown(r), json.loads(render_json(r)), render_html(r)
     assert "今日无实质投资信号" in md
     assert "今日无实质投资信号" in html
@@ -477,3 +528,227 @@ def test_empty_theme_signal_falls_back_to_marker_rule():
     assert ok is True and "未命中泛经济样板表述" in reason
     ok2, reason2 = assess_signal(_signal("会议强调扩大内需，坚定不移完成目标。", []))
     assert ok2 is False and "泛样板" in reason2
+
+
+# ---- 受益主体明确性（语义判定，LLM 侧）→ 信号级闸门第 1 层 ----
+
+
+def _spec_signal(text: str, specificity: str, themes: list[str] | None = None) -> Signal:
+    return Signal(summary=text[:40], quote=text, theme_tags=themes or ["一带一路"],
+                  beneficiary_specificity=specificity)
+
+
+def test_specificity_none_blocks_even_without_boilerplate():
+    """「无受益链条」→ 非投资：机制性双边会议稿没有泛样板词也照样拦。
+
+    词表抓不住「结构性」非投资信号（中—东联委会式），语义判定在 LLM 侧完成，
+    代码只消费枚举。反例文本刻意不含任何 GENERIC_POLICY_MARKERS。
+    """
+    text = ("中国—东帝汶经贸合作联合委员会第二次会议在北京举行。双方就加强经贸务实合作"
+            "深入交换意见，一致同意推动两国经贸关系健康稳定发展。")
+    for marker in GENERIC_POLICY_MARKERS:
+        assert marker not in text, f"反例文本不得含样板词，否则测不出语义层：{marker}"
+    ok, reason = assess_signal(_spec_signal(text, SPECIFICITY_NONE))
+    assert ok is False, f"「无受益链条」必须判非投资：{reason}"
+    assert "受益主体明确性" in reason and SPECIFICITY_NONE in reason
+    # 同一段文本不带语义判定（规则抽取路径）→ 仍放行：证明是语义层在起作用
+    ok_plain, _ = assess_signal(Signal(summary=text[:40], quote=text, theme_tags=["一带一路"]))
+    assert ok_plain is True
+
+
+def test_specificity_directional_and_named_do_not_block():
+    """「有产业方向但无具体主体」「有明确受益主体」不被语义层拦下，交给下游。"""
+    text = "会议提出推动跨境电商海外仓建设，支持企业建设共享式海外仓。"
+    for spec in (SPECIFICITY_DIRECTIONAL, SPECIFICITY_NAMED):
+        ok, reason = assess_signal(_spec_signal(text, spec))
+        assert ok is True, f"语义层不得拦方向性/具名信号（{spec}）：{reason}"
+    # 具名订单文本 + 明确受益主体：明确放行
+    order = "中国交建与东帝汶政府签署 5 亿美元基础设施总承包合同，年内开工。"
+    ok, _ = assess_signal(_spec_signal(order, SPECIFICITY_NAMED))
+    assert ok is True
+
+
+def test_specificity_gate_respects_switch_and_missing_value():
+    """闸门关闭时语义层也关闭；缺省值（规则路径 / 老数据）不启用语义层。"""
+    settings = Settings(investable_gate=False)
+    text = "机制性会议，无具名受益主体。"
+    assert assess_signal(_spec_signal(text, SPECIFICITY_NONE), settings)[0] is True
+    # 缺省 beneficiary_specificity → 跳过语义层，走原有词表路径
+    sig = Signal(summary=text[:40], quote=text, theme_tags=["一带一路"])
+    assert assess_signal(sig)[0] is True
+
+
+# ---- WAN-15 端到端：中—东联委会稿必须落「仅概念关联」，受益个股=0 ----
+
+TIMOR_BODY = (
+    "中国—东帝汶经贸合作联合委员会第二次会议在北京举行。商务部部长助理与东帝汶经济"
+    "协调部长共同主持会议。双方积极评价建交以来双边经贸关系发展，就加强贸易投资、"
+    "基础设施、农业等领域务实合作深入交换意见。会议一致同意，双方将充分发挥联合委员"
+    "会机制作用，推动两国经贸关系健康稳定发展，更好造福两国人民。"
+)
+
+TIMOR_LLM_SIGNAL = [{
+    "summary": "中国—东帝汶经贸合作联合委员会第二次会议举行，推动双边经贸合作",
+    "quote": "双方将充分发挥联合委员会机制作用，推动两国经贸关系健康稳定发展",
+    "direction": "利好", "strength": 3, "horizon": "长期(>6月)", "novelty": "延续",
+    "instruments": ["合作机制"], "theme_tags": ["一带一路"],
+    "affected_regions": ["东帝汶"], "confidence": 0.7,
+    # LLM 语义判定：机制性双边合作、无具名受益方和落点 → 有产业方向但无具体主体
+    "beneficiary_specificity": SPECIFICITY_DIRECTIONAL,
+}]
+
+
+class _BeltRoadMarket:
+    """一带一路概念最小数据集：证明闸门放行时个股本可展开（改动 1 的对照组）。"""
+
+    def sectors(self, block_file: str = CONCEPT_FILE):
+        return {"一带一路": 4} if block_file == CONCEPT_FILE else {"工程建筑": 4}
+
+    def members(self, sector: str, block_file: str = CONCEPT_FILE):
+        return ["601800", "002051", "000065"]
+
+    def tickers(self):
+        return {
+            "601800": Ticker("601800", "中国交建", "sh", "沪市主板", 1500.0),
+            "002051": Ticker("002051", "中工国际", "sz", "深市主板", 220.0),
+            "000065": Ticker("000065", "北方国际", "sz", "深市主板", 180.0),
+        }
+
+
+class _TimorClient:
+    """F10 画像桩：让深读模块有可引用的公司资料，从而真实产出深读结论。"""
+
+    def f10_block(self, code, block):
+        if block == "公司概况":
+            return (f"│公司名称│某国际工程公司{code}│证券代码│{code}│\n"
+                    "│通达信研究行业│工程建筑│证监会行业│土木工程建筑业│\n"
+                    "│主营业务│国际工程承包、成套设备出口与境内工程承包│\n"
+                    "│经营范围│货物进出口；技术培训；对外承包工程│\n")
+        return "".join(f"{s}(行业) 40% 8%\n" for s in ("国际工程", "成套设备"))
+
+
+def _timor_doc() -> DocRecord:
+    return DocRecord(
+        doc_id="doc-timor000000001", url="https://www.mofcom.gov.cn/timor.htm",
+        title="中国—东帝汶经贸合作联合委员会第二次会议举行", org="商务部", tier="中央",
+        source_id="mofcom_xwfb", meeting_type="部长会议", published_at="2026-10-22",
+        fetched_at="2026-10-22T16:00:00+0800", content_hash="th", raw_hash="tr",
+        snapshot_path="data/snapshots/run-t/doc-timor000000001.html",
+        body=TIMOR_BODY,
+    )
+
+
+def test_wan15_timor_article_ends_in_concept_only_with_zero_bullish(tmp_path, monkeypatch):
+    """WAN-15 回归主用例：中—东联委会稿 → 仅概念关联，受益个股=0。
+
+    真实链路：LLM 抽取（beneficiary_specificity=有产业方向但无具体主体）→
+    闸门放行、个股展开（一带一路概念）→ 3 条深读全部「间接 + 影响有限 / 无具体项目」
+    + substantive=否 → report 反向分区降级「仅概念关联」。
+    改前：分区只扫 transmission 文本（含「间接」→ 实质）→ 误标「受益个股」。
+    """
+    from policypulse import llm as llm_mod
+    from policypulse.deepdive import build_deepdives
+
+    monkeypatch.setattr(llm_mod, "llm_available", lambda: True)
+    monkeypatch.setattr(llm_mod, "extract_with_llm",
+                        lambda title, body, timeout=60.0: TIMOR_LLM_SIGNAL)
+
+    store = Store(tmp_path / "wan15.db")
+    signals, conclusions = build_conclusions(
+        [_timor_doc()], store, Settings(), _BeltRoadMarket(), "run-w15", load_theme_alias())
+
+    # 语义判定为「有产业方向但无具体主体」→ 闸门放行，个股本可展开（这一步改前也放行）
+    assert signals and all(s.investable for s in signals), \
+        f"方向性信号不得被语义层拦下：{[(s.summary, s.investable_reason) for s in signals]}"
+    assert signals[0].beneficiary_specificity == SPECIFICITY_DIRECTIONAL
+    with_tickers = [c for c in conclusions if c["tickers"]]
+    assert with_tickers, "对照组：产业链条存在时概念板块本可展开个股"
+
+    # 深读：3 条真实复现（间接 + 否定性 impact），substantive 全部「否」
+    deepdive_payloads = {
+        "601800": {"transmission": "间接", "competition": "在东帝汶无直接业务布局",
+                   "impact": "未提及具体项目，传导有限", "substantive": "否"},
+        "002051": {"transmission": "间接", "competition": "国际工程经验丰富但无当地订单",
+                   "impact": "无直接可验证影响", "substantive": "否"},
+        "000065": {"transmission": "间接", "competition": "区域性承包商，未涉及该合作",
+                   "impact": "无具体项目指向，影响有限", "substantive": "否"},
+    }
+
+    def fake_llm_fn(policy_text, profile_text):
+        code = next((c for c in deepdive_payloads if c in profile_text), "601800")
+        payload = deepdive_payloads[code]
+        return {**payload,
+                "risks": ["合作项目落地不及预期"],
+                "sources": [{"label": "政策原文", "ref": "https://www.mofcom.gov.cn/timor.htm"},
+                            {"label": "公司公开资料", "ref": f"通达信F10:{code}"}]}
+
+    events = cluster_events(conclusions)
+    dives, _ = build_deepdives(events, _TimorClient(), Settings(), llm_fn=fake_llm_fn)
+    assert len(dives) == 3 and all(d.substantive == "否" for d in dives)
+
+    result = RunResult(run_id="run-w15", window_start="2026-10-21", window_end="2026-10-22",
+                       docs=[_timor_doc()], signals=signals, conclusions=conclusions,
+                       events=events, deepdives=dives)
+    result.stats = _stats(docs=1, signals=len(signals), with_tickers=len(with_tickers),
+                          ticker_rows=sum(len(c["tickers"]) for c in with_tickers),
+                          events=len(events), deepdive_count=len(dives))
+
+    payload = json.loads(render_json(result))
+    assert payload["sections"]["受益个股"] == [], \
+        f"中—东联委会稿不得进受益区：{payload['sections']}"
+    assert events and payload["events"][0]["section"] == SECTION_CONCEPT_ONLY, \
+        f"事件必须降级「仅概念关联」：{payload['events'][0]}"
+    # JSON 深读块携带 substantive 判定，供外部审计
+    assert all(d["substantive"] == "否" for d in payload["deepdives"])
+
+    md = render_markdown(result)
+    assert "## 仅概念关联" in md
+    assert events[0].event_id in _md_block(md, "## 仅概念关联")
+    assert "## 受益个股" in md and "今日无实质投资信号" in md
+    store.close()
+
+
+def test_wan15_positive_control_order_signal_still_upgrades(tmp_path, monkeypatch):
+    """正向对照：真·具名订单信号 + 深读判「是」→ 照常进「受益个股」。"""
+    from policypulse import llm as llm_mod
+
+    order_signal = [{
+        "summary": "中国交建签署东帝汶基础设施总承包合同",
+        "quote": "中国交建与东帝汶政府签署 5 亿美元基础设施总承包合同，年内开工",
+        "direction": "利好", "strength": 5, "horizon": "中期(1–6月)", "novelty": "新增",
+        "instruments": ["项目合同"], "theme_tags": ["一带一路"],
+        "affected_regions": ["东帝汶"], "confidence": 0.9,
+        "beneficiary_specificity": SPECIFICITY_NAMED,
+    }]
+    doc = _timor_doc()
+    doc.body = TIMOR_BODY + "中国交建与东帝汶政府签署 5 亿美元基础设施总承包合同，年内开工。"
+    monkeypatch.setattr(llm_mod, "llm_available", lambda: True)
+    monkeypatch.setattr(llm_mod, "extract_with_llm",
+                        lambda title, body, timeout=60.0: order_signal)
+
+    store = Store(tmp_path / "wan15-pos.db")
+    signals, conclusions = build_conclusions(
+        [doc], store, Settings(), _BeltRoadMarket(), "run-pos", load_theme_alias())
+    assert signals[0].investable is True and signals[0].beneficiary_specificity == SPECIFICITY_NAMED
+
+    events = cluster_events(conclusions)
+    deepdives = [DeepDive(
+        ticker_code="601800", ticker_name="中国交建",
+        policy_title=doc.title, policy_summary="签署总承包合同",
+        policy_quote=doc.body[-40:], policy_url=doc.url,
+        profile_business="国际工程承包、成套设备出口",
+        transmission="直接", competition="主要基础设施承包商",
+        impact="已签订 5 亿美元总承包合同，订单本年度陆续确认收入",
+        substantive=SUBSTANTIVE_YES, risks=["汇率波动"],
+        sources=[{"label": "政策原文", "ref": doc.url}], event_id=events[0].event_id)]
+
+    result = RunResult(run_id="run-pos", window_start="2026-10-21", window_end="2026-10-22",
+                       docs=[doc], signals=signals, conclusions=conclusions,
+                       events=events, deepdives=deepdives)
+    result.stats = _stats(docs=1, signals=1, events=1, deepdive_count=1)
+
+    payload = json.loads(render_json(result))
+    assert payload["sections"]["受益个股"] == [events[0].event_id], \
+        "具名订单 + 实质判定「是」必须进受益区"
+    assert payload["events"][0]["section"] == SECTION_BULLISH
+    store.close()

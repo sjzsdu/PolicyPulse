@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from policypulse.config import Settings
+from policypulse.text import simplify_hant
 
 F10_REF_PREFIX = "通达信F10:"
 
@@ -28,33 +29,31 @@ SKIP_INVALID = "个股深度研读已跳过：模型结论缺少可校验的溯�
 
 _REQUIRED = ("transmission", "competition", "impact")
 
-# 传导判断的确定性映射（深读结论反向分区用）。
-# 否定表述必须先判：「无直接传导」「间接情绪面」「实质业务传导有限」里都含
-# 「直接」「间接」，先判肯定词会把 APEC 那批「打脸自己」的深读重新算成实质传导。
-# CR-2：深读输出是自由文本，实测「无直接影响 / 不直接受益 / 暂未看到直接带动」
-# 三条都会先被「直接」捞成实质传导——补否定前缀，按前缀拦而非枚举完整短语。
-NO_SUBSTANCE_CUES: tuple[str, ...] = (
-    "无实质传导", "无实质", "无直接传导", "实质业务传导有限", "传导有限",
-    "关联度低", "影响有限", "缺乏具体措施", "无具体措施", "间接情绪面",
-    "间接、无实质", "仅情绪面", "中性",
-    # 否定前缀（CR-2）：「未看到直接」一条即可覆盖「暂未看到直接 / 尚未看到直接」
-    "无直接", "未直接", "不直接", "未看到直接", "暂无直接",
-)
-SUBSTANCE_CUES: tuple[str, ...] = ("直接", "间接")
+# 深读结论的结构化语义判定字段（`substantive`，LLM 按 prompt 量表输出）。
+# WAN-15 根因：旧实现拿 transmission 的自由文本做词表命中（含「间接」→ 实质），
+# 但「间接」后面跟着的 impact 常常是「影响有限 / 无具体项目 / 无直接可验证」这类
+# 否定性判断——语义判定必须由 LLM 综合 transmission + impact 完成，代码只消费枚举：
+#   "是"   —— impact 明确正面（直接受益 / 显著拉动 / 明确订单 / 纳入试点）→ 可升级受益
+#   "否"   —— impact 为否定性判断（有限 / 无具体 / 未提及 / 难以验证 / 未披露 /
+#             无直接），无论 transmission 写「直接」还是「间接」→ 降级「仅概念关联」
+#   "不确定" / 缺失 —— 判不出来；fail-closed，不得升级为「受益个股」
+SUBSTANTIVE_YES = "是"
+SUBSTANTIVE_NO = "否"
+SUBSTANTIVE_UNCERTAIN = "不确定"
 
 
-def substantive_transmission(transmission: str) -> bool | None:
-    """把 DeepDive.transmission 映射成 (是否实质传导)。
+def substantive_verdict(value: str) -> bool | None:
+    """把深读的结构化 `substantive` 字段映射成 (是否实质影响)。
 
-    返回 True（实质传导）/ False（无实质传导）/ None（判不出来，按无深读处理）。
+    返回 True / False / None（未给出或不可识别 → 调用方按「不升级」处理，fail-closed）。
+    只认枚举值，不做任何自由文本匹配——语义判定发生在 LLM 侧（prompt 量表），
+    代码侧的职责是忠实消费结构化结果，而不是再养一份会漏判的关键词表。
     """
-    text = (transmission or "").strip()
-    if not text:
-        return None
-    if any(cue in text for cue in NO_SUBSTANCE_CUES):
-        return False
-    if any(cue in text for cue in SUBSTANCE_CUES):
+    text = (value or "").strip()
+    if text == SUBSTANTIVE_YES:
         return True
+    if text == SUBSTANTIVE_NO:
+        return False
     return None
 
 
@@ -70,6 +69,8 @@ class DeepDive:
     transmission: str = ""
     competition: str = ""
     impact: str = ""
+    # 结构化语义判定（是/否/不确定）：report 分区只认这个字段，不再扫 transmission 文本
+    substantive: str = ""
     risks: list[str] = field(default_factory=list)
     sources: list[dict] = field(default_factory=list)
     # 深读结论要能反向决定它所属政策事件的报告分区，因此必须记住 event_id
@@ -94,7 +95,7 @@ def validate(payload: dict | None, code: str, settings: Settings) -> dict | None
     for key in _REQUIRED:
         if not str(payload.get(key) or "").strip():
             return None
-    risks = [str(r).strip() for r in (payload.get("risks") or []) if str(r).strip()]
+    risks = [simplify_hant(str(r).strip()) for r in (payload.get("risks") or []) if str(r).strip()]
     sources = payload.get("sources") or []
     if not isinstance(sources, list) or not sources:
         return None
@@ -109,9 +110,12 @@ def validate(payload: dict | None, code: str, settings: Settings) -> dict | None
             return None
         cleaned.append({"label": label, "ref": ref})
     return {
-        "transmission": str(payload["transmission"]).strip(),
-        "competition": str(payload["competition"]).strip(),
-        "impact": str(payload["impact"]).strip(),
+        "transmission": simplify_hant(str(payload["transmission"]).strip()),
+        "competition": simplify_hant(str(payload["competition"]).strip()),
+        "impact": simplify_hant(str(payload["impact"]).strip()),
+        # 结构化语义判定：非必填（老输出没有该字段），原样透传枚举值；
+        # 不可识别的值交给 substantive_verdict 映射成 None（不升级，fail-closed）
+        "substantive": str(payload.get("substantive") or "").strip(),
         "risks": risks[:3],
         "sources": cleaned,
     }
@@ -198,6 +202,7 @@ def build_deepdives(events, client, settings: Settings, llm_fn=None) -> tuple[li
             transmission=checked["transmission"],
             competition=checked["competition"],
             impact=checked["impact"],
+            substantive=checked["substantive"],
             risks=checked["risks"],
             sources=checked["sources"],
             event_id=event.event_id,

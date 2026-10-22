@@ -468,6 +468,8 @@ def _signals_from_llm(doc, store: Store, settings: Settings):
             theme_tags=list(item.get("theme_tags", []))[:5],
             affected_regions=list(item.get("affected_regions", [])),
             confidence=float(item.get("confidence", 0.5)),
+            # 受益主体明确性：LLM 的结构化语义判定，供 investability 闸门第 1 层消费
+            beneficiary_specificity=str(item.get("beneficiary_specificity", "")).strip(),
             model=llm.PROMPT_VERSION,
             prompt_version=llm.PROMPT_VERSION,
         )

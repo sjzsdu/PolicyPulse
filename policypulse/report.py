@@ -19,7 +19,7 @@ from policypulse.config import (
     MAPPING_CAVEAT,
     REPO_ROOT,
 )
-from policypulse.deepdive import substantive_transmission
+from policypulse.deepdive import substantive_verdict
 from policypulse.pipeline import RunResult
 
 # 报告分区：受益个股 > 仅概念关联 > 非投资信号。
@@ -70,10 +70,14 @@ def _is_bullish(c: dict, min_strength: int) -> bool:
 
 
 def _verdicts_by_event(deepdives) -> dict[str, list[bool]]:
-    """event_id -> 该事件各条深读的传导判定（True=实质，False=无实质）。"""
+    """event_id -> 该事件各条深读的语义判定（True=实质影响，False=无实质影响）。
+
+    只认 DeepDive.substantive 的结构化枚举（LLM 侧语义判定），不再扫 transmission
+    自由文本——WAN-15 根因就是词表命中漏掉了 impact 里的否定性判断。
+    """
     out: dict[str, list[bool]] = {}
     for d in deepdives or []:
-        verdict = substantive_transmission(getattr(d, "transmission", ""))
+        verdict = substantive_verdict(getattr(d, "substantive", ""))
         if verdict is None or not getattr(d, "event_id", ""):
             continue
         out.setdefault(d.event_id, []).append(verdict)
@@ -83,12 +87,13 @@ def _verdicts_by_event(deepdives) -> dict[str, list[bool]]:
 def _event_section(ev, verdicts_by_event: dict[str, list[bool]]) -> str:
     """深读结论反向决定事件分区。
 
-    - 没有可投资信号 → 非投资信号（改动 1，词表闸门已判定）
-    - 有深读且无实质传导占多数**或打平**→ 仅概念关联（改动 2，不再授予受益头衔）
+    - 没有可投资信号 → 非投资信号（改动 1，词表闸门 + 受益主体语义闸门已判定）
+    - 有深读且无实质影响占多数**或打平**→ 仅概念关联（改动 2，不再授予受益头衔）
       平局也降级：项目红线是「宁可空着也不编」，1 实质 vs 1 无实质时留在「受益」
       等于替这条实质结论兜底整件事（CR 备注项，顺手改掉）
-    - 有深读且实质传导明显占多数 → 受益个股
-    - 没有深读（未配 LLM）→ 保持现有行为仍进受益区，但明确标注未做传导判定
+    - 有深读且实质影响明显占多数 → 受益个股（只有 LLM 明确判「是」才会走到这里）
+    - 没有可判定的深读（未配 LLM / 未给出 substantive 枚举）→ 保持现有行为仍进
+      受益区，但明确标注未做传导判定；绝不拿 transmission 文本猜升级（fail-closed）
     """
     if not [c for c in ev.conclusions if c.get("investable", True)]:
         return SECTION_NON_INVESTABLE
@@ -320,6 +325,8 @@ def render_markdown(result: RunResult) -> str:
             lines.append(f"- 传导路径：{d.transmission}")
             lines.append(f"- 竞争地位：{d.competition}")
             lines.append(f"- 影响判断：{d.impact}")
+            if getattr(d, "substantive", ""):
+                lines.append(f"- 实质影响判定：{d.substantive}（语义判定，决定事件分区）")
             if d.risks:
                 lines.append(f"- 风险提示：{'；'.join(d.risks)}")
             # 拼好再嵌入：嵌套同引号 f-string 是 PEP 701（仅 3.12+），3.10/3.11 直接 SyntaxError
@@ -382,6 +389,7 @@ def render_json(result: RunResult) -> str:
                 "ticker_code": d.ticker_code, "ticker_name": d.ticker_name,
                 "policy_title": d.policy_title, "transmission": d.transmission,
                 "competition": d.competition, "impact": d.impact,
+                "substantive": getattr(d, "substantive", ""),
                 "risks": d.risks, "sources": d.sources,
                 "event_id": getattr(d, "event_id", ""),
             }

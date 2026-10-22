@@ -33,13 +33,19 @@ def _config() -> tuple[str, str, str]:
     return base, key, model
 
 
-PROMPT_VERSION = "llm-v1"
+PROMPT_VERSION = "llm-v2"
 
 _SYSTEM = (
     "你是政策研究助理。从给定的会议/政策通稿中抽取政策信号。"
     "只输出 JSON 数组，每个元素包含: summary, quote, direction(利好/利空/中性), "
     "strength(1-5), horizon(短期(<1月)/中期(1–6月)/长期(>6月)), novelty(新增/加码/延续/重申/收紧), "
-    "instruments(数组), theme_tags(数组, ≤5), affected_regions(数组), confidence(0-1)。"
+    "instruments(数组), theme_tags(数组, ≤5), affected_regions(数组), confidence(0-1), "
+    "beneficiary_specificity(受益主体明确性，只能是以下三者之一："
+    "「有明确受益主体」=政策指名了受益企业/机构、具体项目、订单或量化额度；"
+    "「有产业方向但无具体主体」=有一般产业或合作方向（如机制性双边合作、区域概念）"
+    "但没有具名受益方和落点；"
+    "「无受益链条」=既无具名受益方也无产业方向，纯样板表述或空泛机制安排)。"
+    "beneficiary_specificity 必须依据原文语义判断，禁止用关键词猜测。"
     "quote 必须是正文中的原文片段，不得改写。"
 )
 
@@ -71,13 +77,18 @@ def extract_with_llm(title: str, body: str, timeout: float = 60.0) -> list[dict]
     return json.loads(content[start : end + 1])
 
 
-DEEPDIVE_PROMPT_VERSION = "llm-deepdive-v1"
+DEEPDIVE_PROMPT_VERSION = "llm-deepdive-v2"
 
 _DEEPDIVE_SYSTEM = (
     "你是政策研究员。给定一条政策原文片段与一家上市公司的公开业务资料，"
     "判断该政策对该公司的传导路径。只输出一个 JSON 对象，字段："
     "transmission(直接/间接/中性), competition(一句话竞争地位，≤60字), "
-    "impact(一句话影响判断，≤80字), risks(数组，≤3条，每条≤40字), "
+    "impact(一句话影响判断，≤80字), "
+    "substantive(是/否/不确定)——综合 transmission 与 impact 做语义判定："
+    "只有 impact 明确正面（直接受益、显著拉动、明确订单、纳入试点等）才输出「是」；"
+    "impact 为否定性判断（影响有限、无具体、未提及、难以验证、未披露、无直接等）时，"
+    "无论 transmission 是「直接」还是「间接」，一律输出「否」；无法判断输出「不确定」。"
+    "risks(数组，≤3条，每条≤40字), "
     "sources(数组，每项 {label, ref}，ref 必须是给定的政策原文 URL 或 通达信F10:<code>)。"
     "资料里没有的事实不得写入结论；写不出就返回 {}。"
 )
