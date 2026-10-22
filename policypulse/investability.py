@@ -1,31 +1,40 @@
-"""信号级可投资性闸门：泛经济样板表述不得映射板块、不得进「受益」表。
+"""信号级可投资性闸门：泛经济样板表述与无受益链条信号不得映射板块、不得进「受益」表。
 
-背景（reports/2026-10-21.md 的真实翻车）：财政部 APEC 财长会通稿里
+背景（reports/2026-10-21.md 与 2026-10-22 的真实翻车）：财政部 APEC 财长会通稿里
 「扩大国内需求、持续扩大高水平对外开放、加快培育增长新动能」这类**泛经济样板表述**
-被抽成主题「新零售」，下游忠实展开 10 只概念股进「受益」表——而同日 3 条深度研读
-全部判「无实质传导」。公司级相关性闸门（relevance.py）在下游救不了被标错的上游主题，
+被抽成主题「新零售」，下游忠实展开 10 只概念股进「受益」表；次日中国—东帝汶经贸
+合作联合委员会（机制性双边会议，无具名受益方 / 订单 / 额度）又被抽成「一带一路」
+展开 10 只概念股。公司级相关性闸门（relevance.py）在下游救不了被标错的上游主题，
 所以判定必须上移到信号层。
 
-判定规则（**确定性词表匹配，不引入任何 LLM 调用**）：
+判定分两层：
 
-1. 命中 ≥1 个 `GENERIC_POLICY_MARKERS` 泛样板词，且
-2. 信号文本（summary + quote）里不含任何具名产业 / 具体项目词
-   → `investable=False`，该信号仍入库可审计，但**跳过板块匹配与个股展开**。
+1. **受益主体明确性（语义判定，LLM 侧）**：抽取时 LLM 按量表输出
+   `beneficiary_specificity`（枚举见下）。判「无受益链条」→ 非投资。
+   语义判定由 LLM 依据原文完成（「这个政策有没有指名受益主体和具体措施」），
+   代码只消费结构化枚举，不做关键词命中——这层专抓 APEC 财长会 / 中—东联委会
+   这类「结构性」非投资信号，词表永远追不上它们的改写。
+2. **词表校验（确定性兜底，无 LLM 也可跑）**：命中 ≥1 个 `GENERIC_POLICY_MARKERS`
+   泛样板词，且信号文本（summary + quote）里不含任何具名产业 / 具体项目词 → 非投资。
+   CR-1 再加一层**主题证据校验**：theme_tags 若只由「泛 alias」命中、原文又不含该
+   主题的具名证据（theme_business 业务词 / 具名 alias / 主题名本身）→ 非投资。
 
-CR-1 补丁（同义改写穿网，例：「大力提振内需，扩大居民消费，培育消费新业态」不含任何
-样板短语却照样被 alias「内需 → 新零售」带进受益表）：判定再加一层**主题证据校验**——
-3. 信号的 theme_tags 若只由「泛 alias」命中、原文又不含该主题的具名证据
-   （theme_business 业务词 / 具名 alias / 主题名本身）→ 判非投资。
-   这样「扩大国内需求」与「提振内需」两种写法都被拦，而真消费政策（含「零售 / 门店」等
-   业务词，或「免税」等具名 alias）自然放行；不扩 denylist，跷跷板只往安全一侧偏。
-
-判定不确定时（既无样板词也无具名产业词）按需求文档归为可投资；
-`Signal.investable` 字段本身保守默认 False，只有判定通过后才写 True。
+被拦信号仍入库可审计，但跳过板块匹配与个股展开。
+`beneficiary_specificity` 缺失（规则抽取路径 / 老数据）时不启用第 1 层，
+仍由第 2 层兜底；`Signal.investable` 字段保守默认 False，只有判定通过才写 True。
 """
 
 from __future__ import annotations
 
 from policypulse.config import Settings, load_theme_alias, load_theme_business
+
+# 受益主体明确性：LLM 抽取时输出的结构化语义判定（prompt 量表钉死这三个枚举值）。
+# 代码只精确消费枚举，不对其它自由文本做 contains 匹配——语义判定在 LLM 侧完成。
+SPECIFICITY_NAMED = "有明确受益主体"
+SPECIFICITY_DIRECTIONAL = "有产业方向但无具体主体"
+SPECIFICITY_NONE = "无受益链条"
+# LLM 侧量表钉死的三个枚举值（prompt 见 llm.py _SYSTEM）
+SPECIFICITY_ENUM: tuple[str, ...] = (SPECIFICITY_NAMED, SPECIFICITY_DIRECTIONAL, SPECIFICITY_NONE)
 
 # 泛经济样板词：出现在任何一篇通稿里都不构成「具体产业 / 具体项目 / 量化措施」。
 # 词表刻意只收「换个会议也能原样套用」的表述，避免把真政策误杀成非投资。
@@ -167,18 +176,40 @@ def theme_evidence(text: str, theme_tags, alias_map: dict[str, list[str]] | None
     return True, "主题未被泛需求措辞唯一支撑，不做证据降级"
 
 
+def specificity_enum_violation(value) -> str | None:
+    """O1 审计：`beneficiary_specificity` 非空但不在量表枚举内 → 返回告警文本。
+
+    这是「模型没守量表」的痕迹——第 1 层对非枚举值只能跳过（交词表兜底），
+    没有告警的话，模型把结构性稿回成自由文本时闸门全穿也查不到。空值
+    （规则抽取路径 / 老数据）与三个枚举值都返回 None。
+    """
+    text = str(value or "").strip()
+    if text and text not in SPECIFICITY_ENUM:
+        return (f"beneficiary_specificity 非量表枚举值「{text}」"
+                f"（应为 {' / '.join(SPECIFICITY_ENUM)}；模型未守量表）")
+    return None
+
+
 def assess_text(text: str, settings: Settings | None = None,
                 business_map: dict[str, list[str]] | None = None,
                 theme_tags=None,
-                alias_map: dict[str, list[str]] | None = None) -> tuple[bool, str]:
+                alias_map: dict[str, list[str]] | None = None,
+                beneficiary_specificity: str | None = None) -> tuple[bool, str]:
     """对一段信号文本做带开关的判定（入库行、CLI 展示共用同一入口）。
 
-    顺序：具名产业词 → 主题证据校验（CR-1）→ 泛样板词兜底。
+    顺序：受益主体明确性（语义判定，LLM 侧）→ 具名产业词 → 主题证据校验（CR-1）
+    → 泛样板词兜底。`beneficiary_specificity` 缺失时跳过第一层（规则路径 / 老数据）。
     """
     settings = settings or Settings()
     if not settings.investable_gate:
         return True, "信号级可投资性闸门已关闭（investable_gate=false）"
     text = text or ""
+    # 第 1 层：LLM 语义判定「无受益链条」→ 直接非投资。
+    # 这是结构化枚举的精确消费，不是词表命中——判定本身由 LLM 读原文语义得出
+    # （机制性双边会议 / 泛样板稿既无具名受益方也无订单额度 → 无受益链条）。
+    if (beneficiary_specificity or "").strip() == SPECIFICITY_NONE:
+        return False, (f"受益主体明确性语义判定为「{SPECIFICITY_NONE}」"
+                       f"（原文未指名受益主体 / 订单 / 额度），不映射板块、不展开个股")
     terms = named_industry_terms(business_map)
     markers = [m for m in GENERIC_POLICY_MARKERS if m in text]
     named_hits = [t for t in terms if t in text]
@@ -202,4 +233,5 @@ def assess_signal(sig, settings: Settings | None = None,
     text = f"{getattr(sig, 'summary', '')}{getattr(sig, 'quote', '')}"
     return assess_text(text, settings, business_map,
                        theme_tags=list(getattr(sig, "theme_tags", None) or []),
-                       alias_map=alias_map)
+                       alias_map=alias_map,
+                       beneficiary_specificity=getattr(sig, "beneficiary_specificity", ""))

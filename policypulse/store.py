@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS signals (
   novelty TEXT, instruments TEXT, theme_tags TEXT, affected_regions TEXT,
   affected_sectors_hint TEXT, confidence REAL, quote_verified INTEGER,
   model TEXT, prompt_version TEXT, extracted_at TEXT,
-  investable INTEGER, investable_reason TEXT
+  investable INTEGER, investable_reason TEXT, beneficiary_specificity TEXT
 );
 CREATE TABLE IF NOT EXISTS sectors (
   sector_name TEXT, sector_source TEXT, member_count INTEGER,
@@ -117,7 +117,8 @@ class Store:
         # 信号级可投资性闸门：老库里的历史信号不回填判定结果（NULL = 未评估），
         # 展示层按当前词表实时判定，避免把历史行硬标成某一侧
         sig_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(signals)")}
-        for col, decl in (("investable", "INTEGER"), ("investable_reason", "TEXT")):
+        for col, decl in (("investable", "INTEGER"), ("investable_reason", "TEXT"),
+                          ("beneficiary_specificity", "TEXT")):
             if col not in sig_columns:
                 self.conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {decl}")
 
@@ -182,11 +183,12 @@ class Store:
                 "INSERT INTO signals(signal_id, doc_id, run_id, summary, quote, direction, strength,"
                 " horizon, novelty, instruments, theme_tags, affected_regions, affected_sectors_hint,"
                 " confidence, quote_verified, model, prompt_version, extracted_at,"
-                " investable, investable_reason)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " investable, investable_reason, beneficiary_specificity)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(signal_id) DO UPDATE SET summary=excluded.summary, quote=excluded.quote,"
                 " direction=excluded.direction, strength=excluded.strength, confidence=excluded.confidence,"
-                " investable=excluded.investable, investable_reason=excluded.investable_reason",
+                " investable=excluded.investable, investable_reason=excluded.investable_reason,"
+                " beneficiary_specificity=excluded.beneficiary_specificity",
                 (
                     sig.signal_id, sig.doc_id, run_id, sig.summary, sig.quote, sig.direction,
                     sig.strength, sig.horizon, sig.novelty, json.dumps(sig.instruments, ensure_ascii=False),
@@ -196,6 +198,7 @@ class Store:
                     sig.confidence, int(sig.quote_verified), sig.model, sig.prompt_version, now(),
                     int(getattr(sig, "investable", False)),
                     getattr(sig, "investable_reason", ""),
+                    getattr(sig, "beneficiary_specificity", ""),
                 ),
             )
 

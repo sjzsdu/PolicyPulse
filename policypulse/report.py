@@ -19,19 +19,25 @@ from policypulse.config import (
     MAPPING_CAVEAT,
     REPO_ROOT,
 )
-from policypulse.deepdive import substantive_transmission
+from policypulse.deepdive import substantive_verdict
 from policypulse.pipeline import RunResult
 
-# 报告分区：受益个股 > 仅概念关联 > 非投资信号。
-# 「概念关联（未做实质传导判定）」是受益区里的标注——没有 LLM 深读时保持现有行为
-# （个股表照常呈现），但不再自称「受益」，避免把未判定包装成结论。
+# 报告分区：受益个股 > 仅概念关联 > 待判定 > 非投资信号。
+# 受益区只收深读明判「有实质影响」的事件；无可判定票的事件（未配 LLM /
+# 模型只回「不确定」）单列「待判定：无实质传导证据」——保持可见（未配 LLM
+# 的日子事件仍能被看到），但不再挂在受益区标题下（R1：标题下挂「未判定」
+# 等于没降级；issue 红线是「受益 = 明说有实质影响，其余全降级」）。
 SECTION_BULLISH = "受益个股"
-SECTION_CONCEPT_PENDING = "概念关联（未做实质传导判定）"
+SECTION_CONCEPT_PENDING = "待判定：无实质传导证据"
 SECTION_CONCEPT_ONLY = "仅概念关联"
 SECTION_NON_INVESTABLE = "非投资信号"
 
-# 受益区里的事件必须落在前两个分区里；仅概念关联与非投资信号各自单独成节
-MAIN_SECTIONS = (SECTION_BULLISH, SECTION_CONCEPT_PENDING)
+# 老报告 JSON 的 pending 键名：分区改名单列后保留别名键（同值），老解析方读旧键
+# 仍拿得到数据；老报告本身（只有旧键）也照常可读
+LEGACY_SECTION_CONCEPT_PENDING = "概念关联（未做实质传导判定）"
+
+# 只有「受益个股」算主区；待判定单列成节，不再进受益区
+MAIN_SECTIONS = (SECTION_BULLISH,)
 
 
 def _esc(text) -> str:
@@ -70,35 +76,51 @@ def _is_bullish(c: dict, min_strength: int) -> bool:
 
 
 def _verdicts_by_event(deepdives) -> dict[str, list[bool]]:
-    """event_id -> 该事件各条深读的传导判定（True=实质，False=无实质）。"""
+    """event_id -> 该事件各条深读的可判定语义票（True=实质影响，False=无实质影响）。
+
+    只认 DeepDive.substantive 的结构化枚举（LLM 侧语义判定），不再扫 transmission
+    自由文本——WAN-15 根因就是词表命中漏掉了 impact 里的否定性判断。
+    「不确定」/缺失不可判定，不进这张表，但计入 `_totals_by_event` 的分母。
+    """
     out: dict[str, list[bool]] = {}
     for d in deepdives or []:
-        verdict = substantive_transmission(getattr(d, "transmission", ""))
+        verdict = substantive_verdict(getattr(d, "substantive", ""))
         if verdict is None or not getattr(d, "event_id", ""):
             continue
         out.setdefault(d.event_id, []).append(verdict)
     return out
 
 
-def _event_section(ev, verdicts_by_event: dict[str, list[bool]]) -> str:
+def _totals_by_event(deepdives) -> dict[str, int]:
+    """event_id -> 该事件深读总条数（含「不确定」/缺失，计入表决分母）。"""
+    out: dict[str, int] = {}
+    for d in deepdives or []:
+        eid = getattr(d, "event_id", "")
+        if eid:
+            out[eid] = out.get(eid, 0) + 1
+    return out
+
+
+def _event_section(ev, verdicts_by_event: dict[str, list[bool]],
+                   totals_by_event: dict[str, int] | None = None) -> str:
     """深读结论反向决定事件分区。
 
-    - 没有可投资信号 → 非投资信号（改动 1，词表闸门已判定）
-    - 有深读且无实质传导占多数**或打平**→ 仅概念关联（改动 2，不再授予受益头衔）
-      平局也降级：项目红线是「宁可空着也不编」，1 实质 vs 1 无实质时留在「受益」
-      等于替这条实质结论兜底整件事（CR 备注项，顺手改掉）
-    - 有深读且实质传导明显占多数 → 受益个股
-    - 没有深读（未配 LLM）→ 保持现有行为仍进受益区，但明确标注未做传导判定
+    - 没有可投资信号 → 非投资信号（信号闸门已判定）
+    - 没有可判定票（未配 LLM / substantive 全为「不确定」或缺失）→ 待判定：
+      单列可见，不进受益区（R1）
+    - 是票必须 **> 全部深读数的一半**才升级受益（O2：不确定/缺失计入分母、
+      视为不抵升级——「不确定」不是「明说」）；否、打平、票不够 → 仅概念关联
+    - 任何情形都绝不拿 transmission 文本猜升级（fail-closed）
     """
     if not [c for c in ev.conclusions if c.get("investable", True)]:
         return SECTION_NON_INVESTABLE
     verdicts = verdicts_by_event.get(ev.event_id) or []
-    if verdicts:
-        no_substance = sum(1 for v in verdicts if not v)
-        if no_substance * 2 >= len(verdicts):
-            return SECTION_CONCEPT_ONLY
+    if not verdicts:
+        return SECTION_CONCEPT_PENDING
+    total = (totals_by_event or {}).get(ev.event_id) or len(verdicts)
+    if sum(1 for v in verdicts if v) * 2 > total:
         return SECTION_BULLISH
-    return SECTION_CONCEPT_PENDING
+    return SECTION_CONCEPT_ONLY
 
 
 def _qualifying(ev, min_strength: int) -> list[dict]:
@@ -147,7 +169,7 @@ def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: in
 
 
 def _non_investable_lines(conclusions: list[dict]) -> list[str]:
-    """非投资信号区：一行一条，带判定依据与原文链接，方便逐条复核词表判定。"""
+    """非投资信号区：一行一条，带判定依据与原文链接，方便逐条复核判定。"""
     rows = [c for c in conclusions if not c.get("investable", True)]
     if not rows:
         return []
@@ -266,11 +288,14 @@ def render_markdown(result: RunResult) -> str:
 
     deepdives = list(getattr(result, "deepdives", None) or [])
     verdicts = _verdicts_by_event(deepdives)
-    sections = {ev.event_id: _event_section(ev, verdicts) for ev in events}
+    totals = _totals_by_event(deepdives)
+    sections = {ev.event_id: _event_section(ev, verdicts, totals) for ev in events}
     main_events = [ev for ev in events
                    if sections[ev.event_id] in MAIN_SECTIONS and _qualifying(ev, min_strength)]
     concept_events = [ev for ev in events
                       if sections[ev.event_id] == SECTION_CONCEPT_ONLY and _qualifying(ev, min_strength)]
+    pending_events = [ev for ev in events
+                      if sections[ev.event_id] == SECTION_CONCEPT_PENDING and _qualifying(ev, min_strength)]
 
     lines.append("## 受益个股")
     lines.append("")
@@ -281,8 +306,8 @@ def render_markdown(result: RunResult) -> str:
         lines.append(f"本轮没有命中「利好、有板块映射且力度 ≥ {min_strength}」的信号。")
         lines.append("")
     if not main_events:
-        lines.append("**今日无实质投资信号**：没有「可投资且未被深读判为无实质传导」的政策事件。"
-                     "下面是仅概念关联与非投资信号留痕。")
+        lines.append("**今日无实质投资信号**：没有深读明判「有实质影响」的政策事件。"
+                     "下面是仅概念关联、待判定与非投资信号留痕。")
         lines.append("")
     for i, ev in enumerate(main_events, start=1):
         _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
@@ -292,6 +317,13 @@ def render_markdown(result: RunResult) -> str:
         lines.append("## 仅概念关联（深读判定无实质传导，不授予受益头衔）")
         lines.append("")
         for i, ev in enumerate(concept_events, start=1):
+            _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
+                          sections[ev.event_id], i)
+
+    if pending_events:
+        lines.append("## 待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）")
+        lines.append("")
+        for i, ev in enumerate(pending_events, start=1):
             _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
                           sections[ev.event_id], i)
 
@@ -320,6 +352,8 @@ def render_markdown(result: RunResult) -> str:
             lines.append(f"- 传导路径：{d.transmission}")
             lines.append(f"- 竞争地位：{d.competition}")
             lines.append(f"- 影响判断：{d.impact}")
+            if getattr(d, "substantive", ""):
+                lines.append(f"- 实质影响判定：{d.substantive}（语义判定，决定事件分区）")
             if d.risks:
                 lines.append(f"- 风险提示：{'；'.join(d.risks)}")
             # 拼好再嵌入：嵌套同引号 f-string 是 PEP 701（仅 3.12+），3.10/3.11 直接 SyntaxError
@@ -344,8 +378,11 @@ def render_markdown(result: RunResult) -> str:
 def render_json(result: RunResult) -> str:
     deepdives = list(getattr(result, "deepdives", None) or [])
     verdicts = _verdicts_by_event(deepdives)
+    totals = _totals_by_event(deepdives)
     events = _ensure_events(result)
-    sections = {ev.event_id: _event_section(ev, verdicts) for ev in events}
+    sections = {ev.event_id: _event_section(ev, verdicts, totals) for ev in events}
+    pending_ids = [e.event_id for e in events
+                   if sections[e.event_id] == SECTION_CONCEPT_PENDING]
     payload = {
         "run_id": result.run_id,
         "window": {"start": result.window_start, "end": result.window_end},
@@ -370,10 +407,12 @@ def render_json(result: RunResult) -> str:
         "sections": {
             "受益个股": [e.event_id for e in events
                        if sections[e.event_id] == SECTION_BULLISH],
-            "概念关联（未做实质传导判定）": [e.event_id for e in events
-                                       if sections[e.event_id] == SECTION_CONCEPT_PENDING],
             "仅概念关联": [e.event_id for e in events
                         if sections[e.event_id] == SECTION_CONCEPT_ONLY],
+            # R1：pending 单列，键名与 md/html 标题同步
+            SECTION_CONCEPT_PENDING: pending_ids,
+            # 老键别名（同值）：老解析方仍读旧键、老报告仍读得到，兼容不破
+            LEGACY_SECTION_CONCEPT_PENDING: pending_ids,
             "非投资信号": [c["signal_id"] for c in result.conclusions
                         if not c.get("investable", True)],
         },
@@ -382,6 +421,7 @@ def render_json(result: RunResult) -> str:
                 "ticker_code": d.ticker_code, "ticker_name": d.ticker_name,
                 "policy_title": d.policy_title, "transmission": d.transmission,
                 "competition": d.competition, "impact": d.impact,
+                "substantive": getattr(d, "substantive", ""),
                 "risks": d.risks, "sources": d.sources,
                 "event_id": getattr(d, "event_id", ""),
             }
@@ -394,9 +434,10 @@ def render_json(result: RunResult) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def _event_html(ev, verdicts_by_event: dict[str, list[bool]], min_strength: int) -> str:
+def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
+                totals_by_event: dict[str, int] | None, min_strength: int) -> str:
     """单个事件的 HTML 段：与 md 的 _render_event 同一套分区与筛选口径。"""
-    section = _event_section(ev, verdicts_by_event)
+    section = _event_section(ev, verdicts_by_event, totals_by_event)
     qualifying = _qualifying(ev, min_strength)
     table_rows = merge_tickers(qualifying)
     trows = "".join(
@@ -446,24 +487,30 @@ def _non_investable_html(conclusions: list[dict]) -> str:
 
 
 def _sections_html(result, events, min_strength: int) -> str:
-    """HTML 的四个分区，与 md / json 使用同一套 _event_section 判定。"""
+    """HTML 的分区，与 md / json 使用同一套 _event_section 判定。"""
     deepdives = list(getattr(result, "deepdives", None) or [])
     verdicts = _verdicts_by_event(deepdives)
-    sections = {ev.event_id: _event_section(ev, verdicts) for ev in events}
+    totals = _totals_by_event(deepdives)
+    sections = {ev.event_id: _event_section(ev, verdicts, totals) for ev in events}
     main_events = [ev for ev in events
                    if sections[ev.event_id] in MAIN_SECTIONS and _qualifying(ev, min_strength)]
     concept_events = [ev for ev in events
                       if sections[ev.event_id] == SECTION_CONCEPT_ONLY and _qualifying(ev, min_strength)]
+    pending_events = [ev for ev in events
+                      if sections[ev.event_id] == SECTION_CONCEPT_PENDING and _qualifying(ev, min_strength)]
 
     parts = ["<h2>受益个股</h2>"]
     if main_events:
-        parts.extend(_event_html(ev, verdicts, min_strength) for ev in main_events)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength) for ev in main_events)
     else:
-        parts.append("<p><strong>今日无实质投资信号</strong>：没有「可投资且未被深读判为无实质传导」"
-                     "的政策事件。下面是仅概念关联与非投资信号留痕。</p>")
+        parts.append("<p><strong>今日无实质投资信号</strong>：没有深读明判「有实质影响」"
+                     "的政策事件。下面是仅概念关联、待判定与非投资信号留痕。</p>")
     if concept_events:
         parts.append("<h2>仅概念关联（深读判定无实质传导，不授予受益头衔）</h2>")
-        parts.extend(_event_html(ev, verdicts, min_strength) for ev in concept_events)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength) for ev in concept_events)
+    if pending_events:
+        parts.append("<h2>待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）</h2>")
+        parts.extend(_event_html(ev, verdicts, totals, min_strength) for ev in pending_events)
     parts.append(_non_investable_html(result.conclusions))
     return "".join(parts)
 

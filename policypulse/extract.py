@@ -90,6 +90,9 @@ class Signal:
     # False = 泛经济样板表述，仍入库可审计，但不映射板块、不展开个股
     investable: bool = False
     investable_reason: str = ""
+    # 受益主体明确性：LLM 抽取时输出的结构化语义判定（枚举见 investability.SPECIFICITY_*）。
+    # 规则抽取路径没有该字段（空串 = 未判定），闸门只对明确的「无受益链条」判定生效
+    beneficiary_specificity: str = ""
 
 
 def normalize(text: str) -> str:

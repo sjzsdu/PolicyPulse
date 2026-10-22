@@ -123,3 +123,40 @@ def test_invalid_payload_is_dropped_not_reported():
                            "sources": [{"label": "编的", "ref": "https://evil.example/x"}]})
     assert dives == []
     assert any(SKIP_INVALID in n for n in notes)
+
+
+# ---- 结构化 substantive 字段（WAN-15：分区判定的唯一依据）----
+
+
+def _valid_payload(**kw):
+    payload = {"transmission": "直接", "competition": "x", "impact": "y",
+               "policy_url": POLICY_URL,
+               "sources": [{"label": "政策原文", "ref": POLICY_URL}]}
+    payload.update(kw)
+    return payload
+
+
+def test_validate_passthrough_substantive_enum():
+    """substantive 原样透传给 report 层，代码不猜、LLM 侧已按量表输出枚举。"""
+    for value in ("是", "否", "不确定"):
+        got = validate(_valid_payload(substantive=value), "600001", Settings())
+        assert got["substantive"] == value
+    # 未给出（老输出 / 提示词未升级前的缓存）→ 空串，分区按「无判定」fail-closed
+    assert validate(_valid_payload(), "600001", Settings())["substantive"] == ""
+
+
+def test_validate_simplifies_hant_in_text_fields():
+    """中東 → 中东：LLM 输出繁体字时按字符映射清洗，不改语义只归一写法。"""
+    got = validate(_valid_payload(
+        transmission="间接",
+        competition="在中東地区承接国际工程",
+        impact="政策提及中東产能合作",
+    ), "600001", Settings())
+    assert "中东" in got["competition"] and "中東" not in got["competition"]
+    assert "中东" in got["impact"] and "中東" not in got["impact"]
+
+
+def test_substantive_is_carried_into_deep_dive_object():
+    dives, _ = build_deepdives([_event([_row()])], _ClientWithF10(), Settings(),
+                               llm_fn=lambda *_: _valid_payload(substantive="否"))
+    assert dives and dives[0].substantive == "否"

@@ -6,6 +6,7 @@ from policypulse.text import (
     extract_publish_time,
     extract_title,
     html_to_text,
+    simplify_hant,
     split_sentences,
 )
 
@@ -67,3 +68,14 @@ def test_html_to_text_strips_scripts():
     text = html_to_text(html)
     assert "var a=1" not in text
     assert "正文内容在这里" in text
+
+
+def test_simplify_hant_fixes_zhongdong_typo():
+    """中東 → 中东：LLM 输出繁体字时按字符映射归一（WAN-15 卫生问题）。"""
+    assert simplify_hant("中東经贸合作") == "中东经贸合作"
+    assert simplify_hant("中東") == "中东"
+    # 简体文本原样通过，不做任何改动
+    assert simplify_hant("中东经贸合作") == "中东经贸合作"
+    assert simplify_hant("") == ""
+    # 其余繁体滑字同样归一（未收录的字原样保留）
+    assert simplify_hant("華經貿聯席會議") == "华经贸联席会议"
