@@ -24,7 +24,7 @@ from policypulse.config import (
 from policypulse.deepdive import DeepDive, build_deepdives
 from policypulse.extract import classify_meeting_type, extract_signals, verify_quote
 from policypulse.http import FetchError, Fetcher, content_hash
-from policypulse.investability import assess_signal
+from policypulse.investability import assess_signal, specificity_enum_violation
 from policypulse.mapping import build_candidates, match_sectors
 from policypulse.scoring import SCORE_VERSION, rank, why_of
 from policypulse.sources.registry import get_adapter
@@ -290,16 +290,20 @@ def _emit_warnings(fetcher, messages: list[str]) -> None:
 def build_conclusions(docs, store: Store, settings: Settings, client: TongstockClient,
                       run_id: str, alias_map,
                       gate_stats: dict | None = None,
-                      business_map: dict | None = None) -> tuple[list, list[dict]]:
+                      business_map: dict | None = None,
+                      audit: dict | None = None) -> tuple[list, list[dict]]:
     """抽取信号并映射到个股；返回 (signals, conclusions)。
 
     `gate_stats`（可选）：接收公司级相关性闸门的逐档计数，
     用于在日报里说明「多少只被放行 / 压低 / 拿不到画像」。
+    `audit`（可选）：接收受益主体明确性量表审计（O1）——非枚举值的计数、
+    逐条明细与一条拼好的告警文本，由 run() 挂进日报告警区。
     """
     concept_sectors = list(client.sectors(CONCEPT_FILE).keys())
     industry_sectors = list(client.sectors(INDUSTRY_FILE).keys())
     universe = client.tickers()
     stats = gate_stats if gate_stats is not None else {}
+    audit_sink = audit if audit is not None else {}
 
     all_signals = []
     conclusions: list[dict] = []
@@ -321,7 +325,13 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
             signals = extract_signals(doc.doc_id, doc.title, doc.body, alias_map, settings)
 
         for sig in signals:
-            # 信号级可投资性闸门：确定性词表判定，在板块匹配与个股展开之前。
+            # O1 量表审计：模型回了非枚举 specificity → 计数 + 逐条明细（不拦判定）
+            note = specificity_enum_violation(getattr(sig, "beneficiary_specificity", ""))
+            if note:
+                audit_sink["enum_violations"] = audit_sink.get("enum_violations", 0) + 1
+                audit_sink.setdefault("details", []).append(f"{sig.signal_id}: {note}")
+            # 信号级可投资性闸门：受益主体明确性语义判定（第 1 层，LLM 侧）+ 词表兜底，
+            # 在板块匹配与个股展开之前。
             # 非投资信号仍入库（可审计），但不映射板块、不展开个股，
             # 并清掉历史 run 遗留的展开行——否则「受益」表里还留着旧个股
             sig.investable, sig.investable_reason = assess_signal(
@@ -401,6 +411,11 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
                 "matched_sectors": [m.sector_name for m in matches],
                 "tickers": tickers,
             })
+    if audit_sink.get("enum_violations"):
+        audit_sink["warning"] = (
+            f"受益主体明确性量表审计：{audit_sink['enum_violations']} 条信号的 "
+            f"beneficiary_specificity 非量表枚举值（模型未守量表）—— "
+            + "；".join(audit_sink["details"][:5]))
     return all_signals, conclusions
 
 
@@ -542,9 +557,11 @@ def run(settings: Settings, paths, target_date: date | None = None,
     client = market_client or TongstockClient(settings, cache_dir=paths.cache,
                                               refresh=refresh_market)
     gate_stats: dict = {}
+    spec_audit: dict = {}
     try:
         signals, conclusions = build_conclusions(docs, store, settings, client, run_id,
-                                                 alias_map, gate_stats, business_map)
+                                                 alias_map, gate_stats, business_map,
+                                                 spec_audit)
     except TongstockError as exc:
         store.finish_run(run_id, "failed", len(docs), 0, 0, notes=f"tongstock: {exc}")
         raise
@@ -554,6 +571,9 @@ def run(settings: Settings, paths, target_date: date | None = None,
     # 个股深度研读：可插拔模块，无 LLM 时整段跳过并写明原因
     dives, deepdive_notes = build_deepdives(events, client, settings)
     warnings.extend(deepdive_notes)
+    # O1：模型没守量表（非枚举 specificity）必须有痕迹可查——进日报告警区
+    if spec_audit.get("warning"):
+        warnings.append(spec_audit["warning"])
 
     ticker_count = sum(len(e["tickers"]) for e in conclusions)
     non_investable = [c for c in conclusions if not c.get("investable", True)]
@@ -595,6 +615,8 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "duplicates_skipped": duplicates,
         "out_of_window_docs": diagnostics.get("out_of_window_docs", 0),
         "gate": gate_stats,
+        # O1 量表审计：非枚举 beneficiary_specificity 计数（0 = 模型守量表）
+        "specificity_enum_violations": int(spec_audit.get("enum_violations") or 0),
         "deepdive_count": len(dives),
         # 央行相关内容条数与来源：WAN-10 的验收要能指认
         "pbc_related_docs": sum(1 for d in docs if is_pbc_related(d.title, d.body)),

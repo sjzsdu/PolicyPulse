@@ -26,7 +26,9 @@ from policypulse.config import default_paths, load_settings  # noqa: E402
 from policypulse.investability import assess_text  # noqa: E402
 from policypulse.pipeline import RunResult  # noqa: E402
 from policypulse.report import (  # noqa: E402
+    LEGACY_SECTION_CONCEPT_PENDING,
     MAIN_SECTIONS,
+    SECTION_CONCEPT_PENDING,
     _qualifying,
     render_html,
     render_json,
@@ -167,8 +169,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print("[sections] 受益个股: " + (", ".join(payload["sections"]["受益个股"]) or "（空）"))
     print("[sections] 仅概念关联: " + (", ".join(payload["sections"]["仅概念关联"]) or "（空）"))
-    print("[sections] 概念关联（未做实质传导判定）: "
-          + (", ".join(payload["sections"]["概念关联（未做实质传导判定）"]) or "（空）"))
+    # R1：pending 单列键；老键做兜底，老报告/老解析方读旧键也拿得到
+    pending_ids_json = (payload["sections"].get(SECTION_CONCEPT_PENDING)
+                        or payload["sections"].get(LEGACY_SECTION_CONCEPT_PENDING) or [])
+    print(f"[sections] {SECTION_CONCEPT_PENDING}: " + (", ".join(pending_ids_json) or "（空）"))
     print("[sections] 非投资信号: " + (", ".join(payload["sections"]["非投资信号"]) or "（空）"))
 
     json_sections = {e["event_id"]: e["section"] for e in payload["events"]}
@@ -199,12 +203,26 @@ def main(argv: list[str] | None = None) -> int:
         label = "受益区为空时三端写明「今日无实质投资信号」"
     print(f"[empty-day] {label}: {'OK' if empty_ok else 'FAIL'}")
 
+    # R1：无票（pending）事件必须单列「待判定」标题，且不出现在受益区标题下
+    pending_expected = [k for k, v in expected.items() if v == SECTION_CONCEPT_PENDING]
+    md_main = (re.split(r"\n## ", md.split("## 受益个股", 1)[1], maxsplit=1)[0]
+               if "## 受益个股" in md else "")
+    html_main = (html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
+                 if "<h2>受益个股</h2>" in html else "")
+    heading = "待判定：无实质传导证据"
+    pending_ok = ((heading in md) == (heading in html) == bool(pending_expected)
+                  and all(i not in md_main and i not in html_main for i in pending_expected))
+    print(f"[pending] 无票事件单列「待判定」、不挂受益区: {'OK' if pending_ok else 'FAIL'}")
+    if not pending_ok:
+        print(f"  待判定={pending_expected}\n  md_main 含待判定事件="
+              f"{[i for i in pending_expected if i in md_main]}")
+
     ni_ids = payload["sections"]["非投资信号"]
     ni_ok = all(i in md and i in html for i in ni_ids)
     print(f"[non-investable] 非投资信号 {len(ni_ids)} 条在 md/html 逐条留痕: "
           f"{'OK' if ni_ok else 'FAIL'}")
 
-    exit_code = 0 if (consistent and empty_ok and ni_ok) else 1
+    exit_code = 0 if (consistent and empty_ok and ni_ok and pending_ok) else 1
 
     if args.report:
         ids = report_signal_ids(args.report)

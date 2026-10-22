@@ -6,7 +6,8 @@
 - 受益主体明确性（LLM 语义判定）「无受益链条」→ 非投资；「有产业方向但无具体主体」
   /「有明确受益主体」→ 交回下游；
 - 深读分区只认结构化 `substantive` 枚举（是/否/不确定），「否」/打平 →「仅概念关联」，
-  明确「是」→「受益个股」，无判定 →「概念关联（未做实质传导判定）」；
+  明确「是」→「受益个股」（且是票必须 > 全部深读数的一半，O2），无可判定票 →
+  「待判定：无实质传导证据」（单列，不进受益区，R1）；
 - md / html / json 三端分区一致。
 
 全程离线：不碰网络、不碰 tongstock、不调 LLM。
@@ -36,6 +37,7 @@ from policypulse.investability import (
     assess_investable,
     assess_signal,
     assess_text,
+    specificity_enum_violation,
     theme_evidence,
 )
 from policypulse.pipeline import DocRecord, RunResult, build_conclusions
@@ -207,7 +209,10 @@ def test_substantive_verdict_consumes_structured_enum_only():
 
 
 def _event_section_of(conclusions, deepdive_specs):
-    """deepdive_specs: [(transmission, impact, substantive)] → 事件分区。"""
+    """deepdive_specs: [(transmission, impact, substantive)] → 事件分区。
+
+    分母按全部深读条数计（O2：「不确定」/缺失计入分母、视为不抵升级）。
+    """
     events = cluster_events(conclusions)
     deepdives = [DeepDive(
         ticker_code="601888", ticker_name="中国中免", policy_title="政策",
@@ -222,7 +227,8 @@ def _event_section_of(conclusions, deepdive_specs):
         verdict = substantive_verdict(d.substantive)
         if verdict is not None:
             verdicts.setdefault(d.event_id, []).append(verdict)
-    return _event_section(events[0], verdicts)
+    totals = {events[0].event_id: len(deepdives)}
+    return _event_section(events[0], verdicts, totals)
 
 
 def _bullish_conclusion(signal_id: str = "doc-bull#1", doc_id: str = "doc-bull") -> dict:
@@ -269,14 +275,38 @@ def test_deepdive_verdict_decides_the_event_section():
     assert _event_section_of([_bullish_conclusion()],
                              [("直接", "明确订单", SUBSTANTIVE_YES),
                               ("直接", "无具体项目指向，影响有限", SUBSTANTIVE_NO)]) == SECTION_CONCEPT_ONLY
-    # 「不确定」/缺失不参与表决，但也绝不被 transmission 文本猜成升级依据
+    # 没有可判定票（全部「不确定」/缺失）→ 待判定单列（R1），绝不被 transmission 文本猜成升级依据
     assert _event_section_of([_bullish_conclusion()],
                              [("直接", "尚在评估", SUBSTANTIVE_UNCERTAIN)]) == SECTION_CONCEPT_PENDING
     assert _event_section_of([_bullish_conclusion()],
                              [("直接", "尚在评估", "")]) == SECTION_CONCEPT_PENDING
+    # O2：「不确定」计入分母——1 是 + 1 不确定（1 > 1 不成立）同样不升级
     assert _event_section_of([_bullish_conclusion()],
                              [("直接", "明确订单", SUBSTANTIVE_YES),
-                              ("间接", "待观察", SUBSTANTIVE_UNCERTAIN)]) == SECTION_BULLISH
+                              ("间接", "待观察", SUBSTANTIVE_UNCERTAIN)]) == SECTION_CONCEPT_ONLY
+
+
+def test_yes_votes_must_exceed_half_of_all_deepdives():
+    """O2 表决口径：是票必须 > 全部深读数的一半，「不确定」/缺失计入分母、不给升级让位。"""
+    # 1 是 + 2 不确定 → 1 > 1.5 不成立 → 仅概念关联（核心用例）
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "明确订单", SUBSTANTIVE_YES),
+                              ("间接", "尚在评估", SUBSTANTIVE_UNCERTAIN),
+                              ("间接", "尚在评估", SUBSTANTIVE_UNCERTAIN)]) == SECTION_CONCEPT_ONLY
+    # 1 是 + 1 否 + 1 不确定 → 1 > 1.5 不成立 → 仅概念关联
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "明确订单", SUBSTANTIVE_YES),
+                              ("间接", "无具体项目", SUBSTANTIVE_NO),
+                              ("间接", "尚在评估", SUBSTANTIVE_UNCERTAIN)]) == SECTION_CONCEPT_ONLY
+    # 2 是 + 1 不确定 → 2 > 1.5 成立 → 照常升级（防焊死）
+    assert _event_section_of([_bullish_conclusion()],
+                             [("直接", "明确订单", SUBSTANTIVE_YES),
+                              ("直接", "订单落地", SUBSTANTIVE_YES),
+                              ("间接", "尚在评估", SUBSTANTIVE_UNCERTAIN)]) == SECTION_BULLISH
+    # 3 张全「是」→ 全票升级
+    assert _event_section_of([_bullish_conclusion()],
+                             [(t, "明确订单", SUBSTANTIVE_YES) for t in ("直接", "直接", "直接")]
+                             ) == SECTION_BULLISH
 
 
 def test_wan15_transmission_alone_never_upgrades():
@@ -414,7 +444,7 @@ def test_three_end_sections_are_consistent():
     html_sections = _html_sections(html)
 
     # md / html 按「事件」渲染分区；非投资信号在两端是信号级一行一条（见下），
-    # 所以事件块只对 受益个股 / 仅概念关联 / 概念关联（未做实质传导判定） 对账
+    # 所以事件块只对 受益个股 / 仅概念关联 / 待判定：无实质传导证据 对账
     block_sections = {k: v for k, v in json_sections.items() if v != SECTION_NON_INVESTABLE}
     assert md_sections and md_sections == block_sections == html_sections, \
         f"三端分区不一致 md={md_sections} json={json_sections} html={html_sections}"
@@ -424,9 +454,12 @@ def test_three_end_sections_are_consistent():
     for key, expected in (
             ("受益个股", [i for i in event_ids if sections_by_event[i] == SECTION_BULLISH]),
             ("仅概念关联", [i for i in event_ids if sections_by_event[i] == SECTION_CONCEPT_ONLY]),
-            ("概念关联（未做实质传导判定）",
+            (SECTION_CONCEPT_PENDING,
              [i for i in event_ids if sections_by_event[i] == SECTION_CONCEPT_PENDING])):
         assert payload["sections"][key] == expected
+    # R1 老键兼容：改名单列后旧键仍发（同值），老解析方读旧键不破
+    assert payload["sections"]["概念关联（未做实质传导判定）"] == \
+        payload["sections"][SECTION_CONCEPT_PENDING]
 
     concept_event = next(e for e in r.events if e.doc_ids[0] == "doc-concept")
     bullish_event = next(e for e in r.events if e.doc_ids[0] == "doc-bull")
@@ -468,6 +501,46 @@ def test_empty_bullish_day_is_stated_on_all_three_ends():
     assert payload["sections"]["受益个股"] == []
     assert payload["sections"]["仅概念关联"], "降级事件仍要留痕"
     assert all(e["section"] != SECTION_BULLISH for e in payload["events"])
+
+
+def test_no_vote_event_renders_under_pending_heading_not_bullish():
+    """R1 文本级：无可判定票的事件必须单列「待判定」，不得再挂在「受益个股」标题下。
+
+    md 与 html 都要按标题块断言（只查 JSON sections 不够——R1 的缺陷正是
+    JSON 干净、md/html 却把「未判定」渲染在受益区标题下）。
+    """
+    r = _mixed_result()
+    # 受益事件的深读改成「不确定」→ 无可判定票 → 落「待判定」；
+    # 另一事件保持「否」→ 落「仅概念关联」；非投资信号不变——三区对照
+    for d in r.deepdives:
+        if d.ticker_code == "601888":
+            d.substantive = SUBSTANTIVE_UNCERTAIN
+    md, payload, html = render_markdown(r), json.loads(render_json(r)), render_html(r)
+    bull_event = next(e for e in r.events if e.doc_ids[0] == "doc-bull")
+    concept_event = next(e for e in r.events if e.doc_ids[0] == "doc-concept")
+
+    # JSON：受益=0；无票事件进「待判定」（新旧键同值）；「否」事件进仅概念关联
+    assert payload["sections"]["受益个股"] == []
+    assert payload["sections"][SECTION_CONCEPT_PENDING] == [bull_event.event_id]
+    assert payload["sections"]["概念关联（未做实质传导判定）"] == [bull_event.event_id]
+    assert payload["sections"]["仅概念关联"] == [concept_event.event_id]
+
+    # md 文本级：受益标题块里既没有无票事件也没有「否」事件
+    md_main = _md_block(md, "## 受益个股")
+    md_pending = _md_block(md, "## 待判定：无实质传导证据")
+    assert bull_event.event_id not in md_main and concept_event.event_id not in md_main
+    assert "今日无实质投资信号" in md_main, "受益区为空要写明空日"
+    assert bull_event.event_id in md_pending and bull_event.title in md_pending
+    assert concept_event.event_id not in md_pending
+
+    # html 同样两块，口径与 md 一致
+    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
+    html_pending = (html.split("<h2>待判定：无实质传导证据", 1)[1]
+                    .split("</h2>", 1)[1].split("<h2>", 1)[0])
+    assert bull_event.event_id not in html_main and concept_event.event_id not in html_main
+    assert "今日无实质投资信号" in html_main
+    assert bull_event.event_id in html_pending
+    assert concept_event.event_id not in html_pending
 
 
 # ---- CR-1：主题证据校验（同义改写漏判 + 具名项目误杀，双向验证） ----
@@ -576,6 +649,43 @@ def test_specificity_gate_respects_switch_and_missing_value():
     # 缺省 beneficiary_specificity → 跳过语义层，走原有词表路径
     sig = Signal(summary=text[:40], quote=text, theme_tags=["一带一路"])
     assert assess_signal(sig)[0] is True
+
+
+def test_non_enum_specificity_triggers_audit(tmp_path, monkeypatch):
+    """O1：非空但非量表枚举的 specificity 必须出审计告警/计数（模型没守量表有痕迹）。"""
+    # 单元：枚举值与缺省都不告警；非空非枚举必须返回告警文本
+    for value in (SPECIFICITY_NAMED, SPECIFICITY_DIRECTIONAL, SPECIFICITY_NONE, "", None, "  "):
+        assert specificity_enum_violation(value) is None, f"不应告警：{value!r}"
+    note = specificity_enum_violation("有受益链条")
+    assert note and "未守量表" in note and "有受益链条" in note
+
+    # 管线级：LLM 回非枚举值 → build_conclusions 的 audit 收到计数、明细与拼好的告警
+    from policypulse import llm as llm_mod
+
+    bad_signal = [{**TIMOR_LLM_SIGNAL[0], "beneficiary_specificity": "有受益链条"}]
+    monkeypatch.setattr(llm_mod, "llm_available", lambda: True)
+    monkeypatch.setattr(llm_mod, "extract_with_llm",
+                        lambda title, body, timeout=60.0: bad_signal)
+    audit: dict = {}
+    store = Store(tmp_path / "audit.db")
+    build_conclusions([_timor_doc()], store, Settings(), _BeltRoadMarket(), "run-au",
+                      load_theme_alias(), audit=audit)
+    store.close()
+    assert audit.get("enum_violations") == 1, f"非枚举值必须计数：{audit}"
+    assert any("doc-timor000000001#llm1" in d for d in audit.get("details", []))
+    warning = audit.get("warning", "")
+    assert "模型未守量表" in warning and "有受益链条" in warning
+
+    # 对照：全部守量表 → 零计数、无告警
+    ok_signal = [TIMOR_LLM_SIGNAL[0]]
+    monkeypatch.setattr(llm_mod, "extract_with_llm",
+                        lambda title, body, timeout=60.0: ok_signal)
+    audit_ok: dict = {}
+    store_ok = Store(tmp_path / "audit-ok.db")
+    build_conclusions([_timor_doc()], store_ok, Settings(), _BeltRoadMarket(), "run-au2",
+                      load_theme_alias(), audit=audit_ok)
+    store_ok.close()
+    assert not audit_ok.get("enum_violations") and not audit_ok.get("warning")
 
 
 # ---- WAN-15 端到端：中—东联委会稿必须落「仅概念关联」，受益个股=0 ----
@@ -705,11 +815,22 @@ def test_wan15_timor_article_ends_in_concept_only_with_zero_bullish(tmp_path, mo
     assert "## 仅概念关联" in md
     assert events[0].event_id in _md_block(md, "## 仅概念关联")
     assert "## 受益个股" in md and "今日无实质投资信号" in md
+
+    # R1 文本级：全「否」（0 张是票）的事件在 md/html 都不得出现在受益区标题下
+    html = render_html(result)
+    md_main = _md_block(md, "## 受益个股")
+    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
+    assert events[0].event_id not in md_main, "无票事件不得挂在「受益个股」标题下"
+    assert events[0].event_id not in html_main, "html 同口径"
     store.close()
 
 
 def test_wan15_positive_control_order_signal_still_upgrades(tmp_path, monkeypatch):
-    """正向对照：真·具名订单信号 + 深读判「是」→ 照常进「受益个股」。"""
+    """正向对照（O3）：真·具名订单信号 + 深读判「是」→ 照常进「受益个股」。
+
+    深读与回归样本同链——经 `build_deepdives` 合成（校验 / 清洗 / 挂 event_id 一致），
+    不再直接构造 DeepDive 对象。
+    """
     from policypulse import llm as llm_mod
 
     order_signal = [{
@@ -732,23 +853,33 @@ def test_wan15_positive_control_order_signal_still_upgrades(tmp_path, monkeypatc
     assert signals[0].investable is True and signals[0].beneficiary_specificity == SPECIFICITY_NAMED
 
     events = cluster_events(conclusions)
-    deepdives = [DeepDive(
-        ticker_code="601800", ticker_name="中国交建",
-        policy_title=doc.title, policy_summary="签署总承包合同",
-        policy_quote=doc.body[-40:], policy_url=doc.url,
-        profile_business="国际工程承包、成套设备出口",
-        transmission="直接", competition="主要基础设施承包商",
-        impact="已签订 5 亿美元总承包合同，订单本年度陆续确认收入",
-        substantive=SUBSTANTIVE_YES, risks=["汇率波动"],
-        sources=[{"label": "政策原文", "ref": doc.url}], event_id=events[0].event_id)]
+    # O3：正向样本与回归样本走同一条合成链——build_deepdives（校验/清洗/挂 event_id 同路）
+    from policypulse.deepdive import build_deepdives
+
+    def fake_llm_fn(policy_text, profile_text):
+        return {"transmission": "直接", "competition": "主要基础设施承包商",
+                "impact": "已签订 5 亿美元总承包合同，订单本年度陆续确认收入",
+                "substantive": SUBSTANTIVE_YES, "risks": ["汇率波动"],
+                "sources": [{"label": "政策原文", "ref": doc.url}]}
+
+    deepdives, notes = build_deepdives(events, _TimorClient(), Settings(), llm_fn=fake_llm_fn)
+    assert deepdives and all(d.substantive == SUBSTANTIVE_YES for d in deepdives), \
+        f"正向深读必须经合成链产出且判定为「是」：{deepdives} / {notes}"
 
     result = RunResult(run_id="run-pos", window_start="2026-10-21", window_end="2026-10-22",
                        docs=[doc], signals=signals, conclusions=conclusions,
                        events=events, deepdives=deepdives)
-    result.stats = _stats(docs=1, signals=1, events=1, deepdive_count=1)
+    result.stats = _stats(docs=1, signals=1, events=1, deepdive_count=len(deepdives))
 
     payload = json.loads(render_json(result))
     assert payload["sections"]["受益个股"] == [events[0].event_id], \
         "具名订单 + 实质判定「是」必须进受益区"
     assert payload["events"][0]["section"] == SECTION_BULLISH
+
+    # 文本级正向对照：事件确实渲染在「受益个股」标题块下
+    md = render_markdown(result)
+    assert events[0].event_id in _md_block(md, "## 受益个股")
+    html = render_html(result)
+    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
+    assert events[0].event_id in html_main
     store.close()

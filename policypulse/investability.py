@@ -33,6 +33,8 @@ from policypulse.config import Settings, load_theme_alias, load_theme_business
 SPECIFICITY_NAMED = "有明确受益主体"
 SPECIFICITY_DIRECTIONAL = "有产业方向但无具体主体"
 SPECIFICITY_NONE = "无受益链条"
+# LLM 侧量表钉死的三个枚举值（prompt 见 llm.py _SYSTEM）
+SPECIFICITY_ENUM: tuple[str, ...] = (SPECIFICITY_NAMED, SPECIFICITY_DIRECTIONAL, SPECIFICITY_NONE)
 
 # 泛经济样板词：出现在任何一篇通稿里都不构成「具体产业 / 具体项目 / 量化措施」。
 # 词表刻意只收「换个会议也能原样套用」的表述，避免把真政策误杀成非投资。
@@ -172,6 +174,20 @@ def theme_evidence(text: str, theme_tags, alias_map: dict[str, list[str]] | None
         return False, (f"主题「{'、'.join(tags)}」在原文无具名证据"
                        f"（业务词 / 具名 alias），仅命中泛需求措辞「{phrases[0]}」")
     return True, "主题未被泛需求措辞唯一支撑，不做证据降级"
+
+
+def specificity_enum_violation(value) -> str | None:
+    """O1 审计：`beneficiary_specificity` 非空但不在量表枚举内 → 返回告警文本。
+
+    这是「模型没守量表」的痕迹——第 1 层对非枚举值只能跳过（交词表兜底），
+    没有告警的话，模型把结构性稿回成自由文本时闸门全穿也查不到。空值
+    （规则抽取路径 / 老数据）与三个枚举值都返回 None。
+    """
+    text = str(value or "").strip()
+    if text and text not in SPECIFICITY_ENUM:
+        return (f"beneficiary_specificity 非量表枚举值「{text}」"
+                f"（应为 {' / '.join(SPECIFICITY_ENUM)}；模型未守量表）")
+    return None
 
 
 def assess_text(text: str, settings: Settings | None = None,
