@@ -24,7 +24,7 @@ from policypulse.config import (
 from policypulse.deepdive import DeepDive, build_deepdives
 from policypulse.extract import classify_meeting_type, extract_signals, verify_quote
 from policypulse.http import FetchError, Fetcher, content_hash
-from policypulse.investability import assess_signal, specificity_enum_violation
+from policypulse.investability import assess_signal, assess_text, specificity_enum_violation
 from policypulse.mapping import build_candidates, match_sectors
 from policypulse.scoring import SCORE_VERSION, rank, why_of
 from policypulse.sources.registry import get_adapter
@@ -54,6 +54,8 @@ class DocRecord:
     snapshot_path: str
     body: str
     duplicate_of: str = ""
+    # 复用库内文档：正文指纹已在库，不重抳/不重抽，信号沿用库内记录
+    reused: bool = False
 
 
 @dataclass
@@ -93,16 +95,21 @@ def is_pbc_related(title: str, body: str) -> bool:
     return bool(PBC_MENTION_RE.search(f"{title}\n{body[:1500]}"))
 
 
-def _source_compliance(specs, docs, fetcher) -> list[dict]:
-    """逐源的合规台账：启用状态 + robots 判定 + 本轮文档数。
+def _source_compliance(specs, docs, fetcher, diagnostics: dict | None = None) -> list[dict]:
+    """逐源的合规台账：启用状态 + robots 判定 + 本轮文档数 + 本轮去向。
 
     停用或本地入库的源**不发起任何网络请求**，因此这里只读 robots 缓存里已经
     发生过的判定，绝不为了填表去补一次请求（否则「没有直连 pbc.gov.cn」就不成立了）。
     """
-    counts: dict[str, int] = {}
+    fresh: dict[str, int] = {}
+    reused: dict[str, int] = {}
     for doc in docs:
-        counts[doc.source_id] = counts.get(doc.source_id, 0) + 1
+        bucket = reused if doc.reused else fresh
+        bucket[doc.source_id] = bucket.get(doc.source_id, 0) + 1
     observed = fetcher.robots.observed() if getattr(fetcher, "robots", None) else {}
+    diag = diagnostics or {}
+    no_update = set(diag.get("no_update", []))
+    failed_ids = {f.split(":", 1)[0].split("/", 1)[0] for f in diag.get("failed", [])}
 
     rows: list[dict] = []
     for spec in specs:
@@ -120,11 +127,29 @@ def _source_compliance(specs, docs, fetcher) -> list[dict]:
                 reason = policy.reason
                 if policy.crawl_delay:
                     reason += f"（站点声明 Crawl-delay: {policy.crawl_delay:g}s）"
+        # 本轮去向：这个源这轮到底产出了什么（入库/复用/无更新/失败），数字才能回溯
+        f_count, r_count = fresh.get(spec.id, 0), reused.get(spec.id, 0)
+        if f_count or r_count:
+            parts = []
+            if f_count:
+                parts.append(f"入库 {f_count}")
+            if r_count:
+                parts.append(f"复用 {r_count}")
+            outcome = " · ".join(parts)
+        elif spec.id in failed_ids:
+            outcome = "抓取失败"
+        elif not spec.enabled:
+            outcome = "—"
+        elif spec.id in no_update:
+            outcome = "窗口内无更新"
+        else:
+            outcome = "无产出"
         rows.append({
             "id": spec.id, "org": spec.org, "tier": spec.tier, "host": host,
             "adapter": spec.adapter, "column": spec.column,
             "enabled": bool(spec.enabled), "robots": status, "robots_reason": reason,
-            "docs": counts.get(spec.id, 0),
+            "docs": f_count + r_count, "fresh_docs": f_count, "reused_docs": r_count,
+            "outcome": outcome,
         })
     return rows
 
@@ -158,6 +183,8 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
     discovered: list[str] = diag.setdefault("discovered", [])
     no_update: list[str] = diag.setdefault("no_update", [])
     out_of_window_docs: int = diag.setdefault("out_of_window_docs", 0)
+    short_body_skipped: int = diag.setdefault("short_body_skipped", 0)
+    out_of_window_cached: int = diag.setdefault("out_of_window_cached", 0)
 
     for spec in specs:
         if not spec.enabled:
@@ -189,13 +216,24 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
         min_body = int(spec.extra.get("min_body_length", 200))
 
         picked = []
+        cached_skips = 0
         for item in items:
             fetcher.configure_rate_limit(item.url, spec.rate_limit_seconds)
             if item.published_at and not _in_window(item.published_at, window_start, window_end):
                 continue
+            # 上轮已判定过窗口外的旧 URL：按库内缓存直接跳过，不再重复请求详情页
+            if store is not None:
+                cached = store.out_of_window_date(item.url)
+                if cached and not _in_window(cached, window_start, window_end):
+                    cached_skips += 1
+                    continue
             picked.append(item)
             if len(picked) >= settings.max_docs_per_source:
                 break
+        if cached_skips:
+            diag["out_of_window_cached"] += cached_skips
+            warnings.append(f"{spec.id}: {cached_skips} 篇旧稿此前已判定窗口外，"
+                            "按库内缓存直接跳过（本轮未重复请求详情页）")
         # 窗口内没有更新 = 真的没有更新：如实记录，不退回抓旧稿
         if items and not picked:
             no_update.append(spec.id)
@@ -217,6 +255,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
             title = SITE_SUFFIX_RE.sub("", title).strip() or item.title
             body = extract_main_text(html)
             if len(body) < min_body:
+                short_body_skipped += 1
                 continue
             published = item.published_at or extract_publish_time(html, body)
             # 列表页没给日期的源（如商务部 xwfb）会绕过上面的窗口过滤，
@@ -224,6 +263,9 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
             if not _in_window(published, window_start, window_end):
                 dropped_out_of_window += 1
                 diag["out_of_window_docs"] += 1
+                # 判定入缓存：下轮同窗口直接跳过，不再重复请求这篇旧稿的详情页
+                if store is not None:
+                    store.remember_out_of_window(item.url, str(published or ""))
                 # 剔除发生在快照落盘之前，产物里不留文档明细；告警是唯一可回溯出口
                 warnings.append(
                     f"{spec.id}: 窗口外剔除 {item.url}（详情页日期 {published} ∉ "
@@ -237,11 +279,29 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
                 continue
             seen_hashes[digest] = item.url
 
-            # F：跨 run 去重——正文指纹已入库就不再重复抽
+            # F：跨 run 去重——正文指纹已入库就不再重抽，但**仍进本报告**：
+            # 从库内恢复信号与个股展开，日报按「窗口 ∩ 库内文档」渲染，
+            # 重跑同一天不会把已入库的文档挤出日报。
             if settings.cross_run_dedupe and store is not None:
                 known = store.document_exists_hash(digest)
                 if known:
                     duplicates_skipped += 1
+                    row = store.document(known)
+                    snap_path = (row["raw_snapshot_path"] if row else "") or ""
+                    if not (snap_path and Path(snap_path).exists()):
+                        # 历史快照被清理过：重写一份到本轮目录，溯源链不能断
+                        snap = snapshot_dir / f"{known}{item.snapshot_ext}"
+                        snap.write_text(html, encoding="utf-8")
+                        snap_path = str(snap)
+                    docs.append(DocRecord(
+                        doc_id=known, url=item.url, title=title, org=spec.org, tier=spec.tier,
+                        source_id=spec.id,
+                        meeting_type=spec.meeting_type_hint or classify_meeting_type(title),
+                        published_at=published,
+                        fetched_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        content_hash=digest, raw_hash=raw_digest,
+                        snapshot_path=snap_path, body=body, reused=True,
+                    ))
                     continue
 
             doc_id = doc_id_for(item.url)
@@ -266,6 +326,7 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
         # 候选全被详情页日期判到窗口外 = 该源窗口内确实没有更新，如实记入 no_update
         if picked and dropped_out_of_window == len(picked):
             no_update.append(spec.id)
+    diag["failed"] = list(failed)
     _emit_warnings(fetcher, warnings)
     return docs, failed, duplicates_skipped
 
@@ -308,6 +369,11 @@ def build_conclusions(docs, store: Store, settings: Settings, client: TongstockC
     all_signals = []
     conclusions: list[dict] = []
     for doc in docs:
+        # 复用库内文档：不重抳、不重写文档行，信号与个股展开从库里恢复
+        if doc.reused:
+            conclusions.extend(
+                _restore_conclusions(store, doc, settings, business_map, alias_map))
+            continue
         store.upsert_document({
             "doc_id": doc.doc_id, "run_id": run_id, "source_id": doc.source_id,
             "url": doc.url, "canonical_url": doc.url, "title": doc.title,
@@ -460,6 +526,84 @@ def _file_of(sector_source: str) -> str:
     return CONCEPT_FILE if sector_source == "通达信概念" else INDUSTRY_FILE
 
 
+def _loads(text: str) -> list:
+    try:
+        value = json.loads(text or "[]")
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _restore_conclusions(store: Store, doc: DocRecord, settings: Settings,
+                         business_map, alias_map) -> list[dict]:
+    """复用文档的结论：从库内信号表恢复，不重跑 LLM / 板块映射。
+
+    库内未评估（investable IS NULL，老库历史行）时按当前词表实时判定，
+    与 `policypulse show` 的口径一致。
+    """
+    out: list[dict] = []
+    for row in store.signals_for_doc(doc.doc_id):
+        summary, quote = row["summary"] or "", row["quote"] or ""
+        themes = _loads(row["theme_tags"])
+        stored = row["investable"]
+        if stored is None:
+            investable, reason = assess_text(
+                f"{summary}{quote}", settings, business_map, theme_tags=themes,
+                alias_map=alias_map,
+                beneficiary_specificity=row["beneficiary_specificity"] or "")
+        else:
+            investable, reason = bool(stored), row["investable_reason"] or ""
+        tickers: list[dict] = []
+        if investable:
+            for t in store.tickers_for_signal(row["signal_id"]):
+                tickers.append({
+                    "ticker_code": t["code"], "ticker_name": t["name"] or "",
+                    "exchange": t["exchange"] or "", "board": t["board"] or "",
+                    "market_cap": t["market_cap_yi"] or 0.0,
+                    "sector_name": t["sector_name"] or "",
+                    "sector_source": t["sector_source"] or "",
+                    "why": t["why"] or "", "score": t["score"] or 0.0,
+                    "rank": t["rank"] or 0, "mapping_path": t["mapping_path"] or "",
+                    "mapping_confidence": t["mapping_confidence"] or 0.0,
+                    "relevance": t["relevance"],
+                    "gate_basis": t["gate_basis"] or "",
+                    "gate_evidence": t["gate_evidence"] or "",
+                })
+        matched = list(dict.fromkeys(t["sector_name"] for t in tickers if t["sector_name"]))
+        out.append({
+            "signal_id": row["signal_id"],
+            "doc_id": doc.doc_id,
+            "doc_title": doc.title,
+            "summary": summary,
+            "direction": row["direction"] or "中性",
+            "strength": int(row["strength"] or 3),
+            "horizon": row["horizon"] or "",
+            "novelty": row["novelty"] or "",
+            "instruments": _loads(row["instruments"]),
+            "theme_tags": themes,
+            "confidence": row["confidence"] or 0.0,
+            "quote": quote,
+            "quote_verified": bool(row["quote_verified"]),
+            "source_url": doc.url,
+            "publisher": doc.org,
+            "org": doc.org,
+            "meeting_type": doc.meeting_type,
+            "published_at": doc.published_at,
+            "fetched_at": row["extracted_at"] or doc.fetched_at,
+            "content_hash": doc.content_hash,
+            "raw_hash": doc.raw_hash,
+            "raw_snapshot_path": doc.snapshot_path,
+            "model": row["model"] or "",
+            "prompt_version": row["prompt_version"] or "",
+            "investable": investable,
+            "investable_reason": reason,
+            "matched_sectors": matched,
+            "tickers": tickers,
+            "reused": True,
+        })
+    return out
+
+
 def _signals_from_llm(doc, store: Store, settings: Settings):
     from policypulse.extract import Signal
 
@@ -549,7 +693,7 @@ def run(settings: Settings, paths, target_date: date | None = None,
             fetcher, specs, settings, window_start, window_end, snapshot_dir, run_id, store,
             diagnostics)
         warnings.extend(getattr(fetcher, "warnings", []))
-        source_rows = _source_compliance(all_specs, docs, fetcher)
+        source_rows = _source_compliance(all_specs, docs, fetcher, diagnostics)
     finally:
         if owns_fetcher:
             fetcher.close()
@@ -581,6 +725,8 @@ def run(settings: Settings, paths, target_date: date | None = None,
         warnings.append(spec_audit["warning"])
 
     ticker_count = sum(len(e["tickers"]) for e in conclusions)
+    ticker_rows_event = sum(len(e.tickers) for e in events)
+    reused_docs = sum(1 for d in docs if d.reused)
     non_investable = [c for c in conclusions if not c.get("investable", True)]
     store.finish_run(run_id, "ok", len(docs), len(signals), ticker_count,
                      notes="; ".join(failed)[:500])
@@ -598,9 +744,14 @@ def run(settings: Settings, paths, target_date: date | None = None,
     no_update = [s for s in diagnostics.get("no_update", []) if s in net_source_ids]
     result.stats = {
         "docs": len(docs),
-        "signals": len(signals),
+        # signals = 报告内信号总数（含复用恢复）；signals_extracted = 本 run 新抽
+        "signals": len(conclusions),
+        "signals_extracted": len(signals),
+        "reused_docs": reused_docs,
         "with_tickers": sum(1 for c in conclusions if c["tickers"]),
         "ticker_rows": ticker_count,
+        # 事件内按代码去重后的个股数：与 ticker_rows（按信号累计）口径分开
+        "ticker_rows_event": ticker_rows_event,
         # 信号级可投资性闸门：非投资信号 = 泛经济样板表述，只留审计行
         "investable_gate": settings.investable_gate,
         "non_investable_signals": len(non_investable),
@@ -619,6 +770,9 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "fetch_failures": len(failed),
         "duplicates_skipped": duplicates,
         "out_of_window_docs": diagnostics.get("out_of_window_docs", 0),
+        # 正文过短 / 窗口外缓存跳过：曾经的静默 continue，现在都有计数可回溯
+        "short_body_skipped": diagnostics.get("short_body_skipped", 0),
+        "out_of_window_cached": diagnostics.get("out_of_window_cached", 0),
         "gate": gate_stats,
         # O1 量表审计：非枚举 beneficiary_specificity 计数（0 = 模型守量表）
         "specificity_enum_violations": int(spec_audit.get("enum_violations") or 0),

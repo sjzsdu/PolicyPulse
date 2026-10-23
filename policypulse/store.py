@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS verify_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   doc_id TEXT, url TEXT, checked_at TEXT, status TEXT, old_hash TEXT, new_hash TEXT
 );
+CREATE TABLE IF NOT EXISTS out_of_window_cache (
+  url TEXT PRIMARY KEY,
+  published TEXT,
+  checked_at TEXT
+);
 """
 
 
@@ -152,6 +157,18 @@ class Store:
                 (now(), status, docs, signals, tickers, notes, run_id),
             )
 
+    def latest_run_for(self, window_end: str, status: str | None = "ok") -> str | None:
+        """窗口结束日为该日的最近一次 run_id（preview 的库内兑底取数口）。
+
+        优先成功 run；status=None 时不限状态（宁可拿旧信号，也不让 preview 空手）。
+        """
+        sql = ("SELECT run_id FROM runs WHERE window_end=?"
+               + (" AND status=?" if status else "")
+               + " ORDER BY started_at DESC LIMIT 1")
+        args = (window_end, status) if status else (window_end,)
+        row = self.conn.execute(sql, args).fetchone()
+        return row["run_id"] if row else None
+
     # ---- documents ----
     def upsert_document(self, row: dict[str, Any]) -> None:
         cols = ["doc_id", "run_id", "source_id", "url", "canonical_url", "title", "publisher",
@@ -205,6 +222,11 @@ class Store:
     def signals_for_run(self, run_id: str) -> list[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM signals WHERE run_id=? ORDER BY strength DESC, confidence DESC", (run_id,)))
+
+    def signals_for_doc(self, doc_id: str) -> list[sqlite3.Row]:
+        """一篇文档此前抽出的全部信号（复用库内文档时按此恢复结论）。"""
+        return list(self.conn.execute(
+            "SELECT * FROM signals WHERE doc_id=? ORDER BY strength DESC, confidence DESC", (doc_id,)))
 
     def signal(self, signal_id: str) -> sqlite3.Row | None:
         return self.conn.execute("SELECT * FROM signals WHERE signal_id=?", (signal_id,)).fetchone()
@@ -284,6 +306,31 @@ class Store:
                 "INSERT INTO verify_log(doc_id,url,checked_at,status,old_hash,new_hash) VALUES(?,?,?,?,?,?)",
                 (doc_id, url, now(), status, old_hash, new_hash),
             )
+
+    # ---- 窗口外旧稿缓存 ----
+    def remember_out_of_window(self, url: str, published: str) -> None:
+        """记下「该 URL 详情页日期在窗口外」的判定，避免下轮重复请求详情页。"""
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO out_of_window_cache(url,published,checked_at) VALUES(?,?,?)"
+                " ON CONFLICT(url) DO UPDATE SET published=excluded.published,"
+                " checked_at=excluded.checked_at",
+                (url, published, now()),
+            )
+
+    def out_of_window_date(self, url: str, max_age_days: int = 30) -> str | None:
+        """缓存的窗口外判定日期；过期返回 None（让调用方重新判定）。"""
+        row = self.conn.execute(
+            "SELECT published, checked_at FROM out_of_window_cache WHERE url=?", (url,)).fetchone()
+        if row is None:
+            return None
+        try:
+            checked = time.mktime(time.strptime(row["checked_at"], "%Y-%m-%dT%H:%M:%S%z"))
+        except (ValueError, TypeError):
+            return None
+        if time.time() - checked > max_age_days * 86400:
+            return None
+        return row["published"]
 
     def sources_upsert(self, spec) -> None:
         with self.tx() as c:

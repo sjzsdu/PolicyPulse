@@ -150,9 +150,11 @@ def test_inbound_respects_cross_run_dedupe(inbound, tmp_path, monkeypatch):
 
     second, _, dupes = fetch_documents(_NoNetworkFetcher(), [spec], Settings(), "2026-10-06",
                                        "2026-10-19", paths.snapshots / "r2", "r2", store)
-    # 文件没删：靠正文指纹拦住重复抽取
+    # 文件没删：靠正文指纹拦住重复抽取，但文档仍以复用态进本轮报告，
+    # 重跑同一天不会把已入库的文档挤出日报
     assert (inbound / "2026-10-18-公开市场业务交易公告.md").exists()
-    assert second == [] and dupes == 1
+    assert dupes == 1
+    assert len(second) == 1 and second[0].reused and second[0].doc_id == first[0].doc_id
     store.close()
 
 

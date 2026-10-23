@@ -240,8 +240,10 @@ class Fetcher:
                 self._warned_hosts.add(host)
                 msg = (f"{host}: {policy.reason}，无 robots 判定依据，"
                        f"按保守间隔 {conservative}s 抓取")
+                # 只挂 warnings（进日报告警区），不再同时打 log：
+                # 同一条告警 stdout/stderr 各出一次，读起来像两件事
                 self.warnings.append(msg)
-                log.warning(msg)
+                log.debug(msg)
 
     # ---------- 抓取 ----------
     def get_text(self, url: str) -> str:

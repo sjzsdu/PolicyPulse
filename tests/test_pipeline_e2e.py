@@ -134,7 +134,7 @@ def test_end_to_end_offline(workspace):
 
 
 def test_cross_run_dedupe_skips_already_seen_documents(workspace):
-    """F：第二次 run 应命中跨 run 去重，而不是重复抽取。"""
+    """F：第二次 run 命中跨 run 去重——不重复抽取，但文档以复用态进本轮报告。"""
     paths, snapshot_dir = workspace
     store = Store(paths.db)
     first_docs, _, first_dupes = _run_once(paths, snapshot_dir, store)
@@ -142,8 +142,15 @@ def test_cross_run_dedupe_skips_already_seen_documents(workspace):
     build_conclusions(first_docs, store, Settings(), _MiniMarket(), "run-1", load_theme_alias())
 
     second_docs, _, second_dupes = _run_once(paths, snapshot_dir, store)
-    assert second_docs == []
     assert second_dupes == 1
+    assert len(second_docs) == 1
+    assert second_docs[0].reused and second_docs[0].doc_id == first_docs[0].doc_id
+
+    # 复用文档不再重抽：结论从库内信号恢复，signals（新抽）为空
+    signals, conclusions = build_conclusions(second_docs, store, Settings(), _MiniMarket(),
+                                             "run-2", load_theme_alias())
+    assert signals == []
+    assert conclusions and all(c.get("reused") for c in conclusions)
     store.close()
 
 

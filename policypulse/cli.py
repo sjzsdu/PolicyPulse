@@ -18,8 +18,10 @@ from policypulse import llm
 from policypulse.config import EMPTY_DAY_NOTICE, default_paths, load_settings, load_sources
 from policypulse.investability import assess_text
 from policypulse.pipeline import run as run_pipeline
+from policypulse.preview import build_preview
 from policypulse.report import write_reports
 from policypulse.store import Store
+from policypulse.tongstock import TongstockError
 from policypulse.verify import OK_STATUSES, render_verify, verify_documents
 
 
@@ -45,6 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify = sub.add_parser("verify", help="重抓原文核对结论")
     p_verify.add_argument("--run", dest="run_id", help="复核该 run 的全部文档")
     p_verify.add_argument("--doc", action="append", default=[], help="复核指定 doc_id（可重复）")
+
+    p_prev = sub.add_parser("preview", help="验证：某日日报个股从该日至今的股价走势 + 汇总统计（生成网页并自动打开）")
+    p_prev.add_argument("--date", required=True, help="日报日期 YYYY-MM-DD")
+    p_prev.add_argument("--report", type=Path, default=None,
+                        help="指定日报 JSON（默认 reports/<date>.json；缺文件时回退库内同窗口 run）")
+    p_prev.add_argument("--out", type=Path, default=None,
+                        help="输出 HTML 路径（默认 reports/<date>-preview.html）")
+    p_prev.add_argument("--no-open", action="store_true", help="只生成文件，不自动打开浏览器")
 
     sub.add_parser("sources", help="列出信息源清单")
     sub.add_parser("selftest", help="检查 tongstock / 网络 / LLM 可用性")
@@ -72,10 +82,14 @@ def cmd_run(args) -> int:
           f"sources_ok={result.stats['sources_ok']}/{result.stats['sources_total']} "
           f"llm={'on' if result.stats['llm_enabled'] else 'off'}"
           f" dedupe_skipped={result.duplicates_skipped}", flush=True)
+    # 终端只打前 10 条，但必须说清楚还有多少条没打——否则告警数在终端不可回溯
     for failure in result.failed_sources[:10]:
         print(f"[policypulse][warn] {failure}", flush=True)
     for warning in result.warnings[:10]:
         print(f"[policypulse][warn] {warning}", flush=True)
+    if len(result.warnings) > 10:
+        print(f"[policypulse][warn] …另有 {len(result.warnings) - 10} 条告警未在终端显示，"
+              "完整清单见日报告警区 / JSON warnings", flush=True)
 
     if not args.no_report:
         written = write_reports(result, paths.reports)
@@ -153,6 +167,36 @@ def cmd_verify(args) -> int:
     return 0 if changed == 0 else 2
 
 
+def cmd_preview(args) -> int:
+    try:
+        target = datetime.strptime(args.date, "%Y-%m-%d").date()
+    except ValueError:
+        print("--date 须为 YYYY-MM-DD（例：2026-10-22）", file=sys.stderr)
+        return 2
+    if target > date.today():
+        print("目标日期在未来：还没到那一天，没有行情可验证", file=sys.stderr)
+        return 2
+
+    settings = load_settings()
+    paths = default_paths()
+    try:
+        out = build_preview(target.isoformat(), paths, settings,
+                            report_json=args.report, out=args.out,
+                            open_browser=not args.no_open,
+                            progress=lambda msg: print(f"[policypulse] {msg}", flush=True))
+    except TongstockError as exc:
+        print(f"[policypulse] 行情取数失败：{exc}", file=sys.stderr)
+        return 1
+    if out is None:
+        print(f"[policypulse] 找不到 {target} 日报选中的个股："
+              f"reports/{target}.json 不存在或为空，库内也没有该窗口的 run；"
+              "先跑 `policypulse run --date " + target.isoformat() + "`。",
+              file=sys.stderr)
+        return 1
+    print(f"[policypulse] preview -> {out}", flush=True)
+    return 0
+
+
 def cmd_sources(args) -> int:
     for spec in load_sources():
         flag = "on " if spec.enabled else "off"
@@ -204,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         "run": cmd_run,
         "show": cmd_show,
         "verify": cmd_verify,
+        "preview": cmd_preview,
         "sources": cmd_sources,
         "selftest": cmd_selftest,
     }
