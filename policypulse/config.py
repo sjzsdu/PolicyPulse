@@ -142,14 +142,39 @@ class Settings:
     # 过滤
     min_market_cap_yi: float = 30.0
     exclude_bj: bool = True
-    max_tickers_per_signal: int = 10
+    # 选股硬上限（WAN-21）：一次选股最多产出几只个股。
+    # 口径是「先排序、再截断」——按打分（score 越高 = 相对上涨概率越大）降序排，
+    # 取前 max_picks 只；候选不足时按实际数量返回，不补位。信号级排序
+    # （scoring.rank）与事件级个股汇总（clustering.cluster_events）共用这一上限。
+    max_picks: int = 5
+    # 全局选股上限（WAN-21 v2）：整份日报所有政策事件合计最多几只个股。
+    # 先跨事件按代码去重（同码留 score 最高那次）、全局 score 降序排，再截断到该数量。
+    # 0 = 关闭全局截断，退回「每个政策事件各 max_picks 只」的旧口径（可回退开关）。
+    global_max_picks: int = 5
     # tongstock
     tongstock_bin: str = "tongstock"
     tongstock_cache_ttl_hours: int = 24
 
+    def __post_init__(self) -> None:
+        """配置层的下限校验：上限非法要在启动时就报错，而不是静默产出空选股。
+
+        `max_picks` 必须 >= 1；`global_max_picks` 的 0 是合法的「关闭全局截断」值，
+        不能和异常值一起拦掉。
+        """
+        if int(self.max_picks) < 1:
+            raise ValueError(
+                f"max_picks 必须 >= 1（当前 {self.max_picks}）："
+                "0 会让每只股票都被截断；要关闭全局上限请设 global_max_picks: 0")
+        if int(self.global_max_picks) < 0:
+            raise ValueError(f"global_max_picks 必须 >= 0（当前 {self.global_max_picks}）")
+
     @classmethod
     def from_file(cls, path: Path) -> "Settings":
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        # WAN-21 起 `max_tickers_per_signal` 更名为 `max_picks`（选股 5 只硬上限）。
+        # 老配置里的旧键按上限语义迁移，且不允许把「先排序再取前 5」的硬约束放大回去。
+        if "max_picks" not in raw and "max_tickers_per_signal" in raw:
+            raw["max_picks"] = min(int(raw["max_tickers_per_signal"]), cls.max_picks)
         return cls(**{k: v for k, v in raw.items() if k in cls.__dataclass_fields__})
 
 

@@ -21,3 +21,36 @@ def test_config_example_parses_and_keeps_expected_keys():
     assert data["relevance_gate"] is True, "公司级相关性闸门默认开"
     assert data["min_relevance"] == 0.5, "弱命中（0.45）默认不进正文"
     assert "lookback_days" not in data, "lookback_days 已删除，模板里不得复活"
+    assert data["max_picks"] == 5, "选股上限默认 5 只（WAN-21）"
+    assert data["global_max_picks"] == 5, "全局选股上限默认 5 只（WAN-21 v2）"
+    assert "max_tickers_per_signal" not in data, "旧键已改名 max_picks，模板里不得复活"
+
+
+def test_old_max_tickers_key_migrates_without_raising_the_cap(tmp_path):
+    """老配置里的旧键不能把「先排序再取前 5」放大回 10 只。"""
+    from policypulse.config import Settings
+
+    cfg = tmp_path / "policypulse.yaml"
+    cfg.write_text("max_tickers_per_signal: 10\n", encoding="utf-8")
+    assert Settings.from_file(cfg).max_picks == 5
+
+    cfg.write_text("max_tickers_per_signal: 3\n", encoding="utf-8")
+    assert Settings.from_file(cfg).max_picks == 3
+
+    cfg.write_text("max_picks: 4\nmax_tickers_per_signal: 10\n", encoding="utf-8")
+    assert Settings.from_file(cfg).max_picks == 4, "新键优先"
+
+
+def test_pick_limit_validation():
+    """max_picks 必须 >= 1；global_max_picks 的 0 是合法「关闭全局截断」值。"""
+    import pytest
+
+    from policypulse.config import Settings
+
+    with pytest.raises(ValueError):
+        Settings(max_picks=0)
+    with pytest.raises(ValueError):
+        Settings(max_picks=-1)
+    assert Settings(global_max_picks=0).global_max_picks == 0, "0 合法：关闭全局截断"
+    with pytest.raises(ValueError):
+        Settings(global_max_picks=-1)

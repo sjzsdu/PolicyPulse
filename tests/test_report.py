@@ -206,3 +206,214 @@ def test_report_carries_the_per_source_compliance_ledger():
 
     payload = json.loads(render_json(_with_compliance(_result())))
     assert payload["stats"]["sources_detail"][0]["robots"] == "allowed"
+
+
+def _with_many_tickers(n: int = 8) -> RunResult:
+    """一只事件里塞 n 只个股（score 递减），用于核对报告层的选股上限。"""
+    r = _result()
+    base = dict(r.conclusions[0]["tickers"][0])
+    r.conclusions[0]["tickers"] = [
+        {**base, "ticker_code": f"6000{i:02d}", "ticker_name": f"测试{i}", "score": 90.0 - i}
+        for i in range(1, n + 1)
+    ]
+    return r
+
+
+def test_markdown_event_table_is_capped_at_five_picks():
+    """5 只上限在报告里同样生效：留下的是 score 最高的 5 只，低分的不出现。"""
+    md = render_markdown(_with_many_tickers(8))
+    for i in range(1, 6):
+        assert f"6000{i:02d}" in md, f"前 5 只里的 6000{i:02d} 必须出现"
+    for i in range(6, 9):
+        assert f"6000{i:02d}" not in md, f"6000{i:02d} 分数更低，不该出现在日报里"
+    assert "选股上限" in md
+
+
+def test_html_event_table_is_capped_at_five_picks():
+    out = render_html(_with_many_tickers(8))
+    for i in range(1, 6):
+        assert f"6000{i:02d}" in out
+    for i in range(6, 9):
+        assert f"6000{i:02d}" not in out
+
+
+def test_json_event_tickers_is_capped_at_five_picks():
+    payload = json.loads(render_json(_with_many_tickers(8)))
+    tickers = payload["events"][0]["tickers"]
+    assert [t["ticker_code"] for t in tickers] == [f"6000{i:02d}" for i in range(1, 6)]
+
+
+def _multi_event_result(global_cap: int = 5) -> RunResult:
+    """两个政策事件各 3 只（分数交叉），用于核对整份日报的全局上限。"""
+    r = _result()
+    base = r.conclusions[0]
+    row = base["tickers"][0]
+
+    def tk(code: str, score: float) -> dict:
+        return {**row, "ticker_code": code, "ticker_name": f"测试{code}", "score": score,
+                "mapping_path": f"低空经济 → 低空经济(通达信概念) → {code}"}
+
+    r.conclusions = [
+        {**base, "signal_id": "doc-1#1", "doc_id": "doc-1",
+         "tickers": [tk("600001", 10.0), tk("600002", 20.0), tk("600003", 30.0)]},
+        {**base, "signal_id": "doc-2#1", "doc_id": "doc-2", "doc_title": "另一场会议",
+         "source_url": "https://www.gov.cn/b.htm", "published_at": "2026-10-10",
+         "tickers": [tk("600004", 15.0), tk("600005", 25.0), tk("600006", 35.0)]},
+    ]
+    r.stats["global_max_picks"] = global_cap
+    return r
+
+
+CODES = ["600001", "600002", "600003", "600004", "600005", "600006"]
+
+
+def _shown(text: str) -> list[str]:
+    return [code for code in CODES if code in text]
+
+
+def test_multi_event_report_total_is_capped_at_five():
+    """一天多事件时整份日报的个股总数 ≤5，留下的是全局 score 最高的 5 只。"""
+    r = _multi_event_result()
+    md = render_markdown(r)
+    shown = _shown(md)
+    assert len(shown) == 5, f"md 里个股数必须 <= 5，实际 {shown}"
+    for code in ("600006", "600003", "600005", "600002", "600004"):
+        assert code in md, f"全局前 5 名里的 {code} 必须出现"
+    assert "600001" not in md, "分数最低的 600001 不该挤进全局 Top-5"
+    assert "| 全局入选个股（上限 5） | 5 |" in md, "概览要给可核对的全局入选数"
+
+    out = render_html(r)
+    assert len(_shown(out)) == 5 and "600001" not in out
+
+    payload = json.loads(render_json(r))
+    shown = [t["ticker_code"] for e in payload["events"] for t in e["tickers"]]
+    assert len(shown) == 5 and "600001" not in shown
+
+
+def test_multi_event_report_falls_back_when_global_cap_disabled():
+    """global_max_picks=0 = 关闭：退回每事件口径，两个事件各 3 只都能出现。"""
+    r = _multi_event_result(global_cap=0)
+    md = render_markdown(r)
+    assert len(_shown(md)) == 6, f"关闭后应按每事件口径列出：{_shown(md)}"
+    assert "全局截断已关闭" in md
+
+
+def test_pipeline_style_result_stays_capped_globally():
+    """线上路径：events 已由 pipeline 回写、stats 带 global_top_codes —— 三端仍是 ≤5。"""
+    from policypulse.clustering import apply_global_pick_cap, cluster_events
+
+    r = _multi_event_result()
+    events = cluster_events(r.conclusions, 5)
+    r.stats["global_top_codes"] = apply_global_pick_cap(events, 5)
+    r.events = events
+
+    md = render_markdown(r)
+    assert len(_shown(md)) == 5, f"md 里的个股数必须 <= 5，实际 {_shown(md)}"
+    payload = json.loads(render_json(r))
+    assert sum(len(e["tickers"]) for e in payload["events"]) == 5
+    assert len(_shown(render_html(r))) == 5
+
+
+def test_event_with_all_picks_cut_shows_notice_instead_of_empty_table():
+    """某个事件的个股全被全局裁掉时，日报给一行说明，不留空表。"""
+    from policypulse.clustering import apply_global_pick_cap, cluster_events
+
+    r = _multi_event_result()
+    base = r.conclusions[0]
+
+    def tk(code: str, score: float) -> dict:
+        return {**base["tickers"][0], "ticker_code": code, "ticker_name": f"测试{code}",
+                "score": score,
+                "mapping_path": f"低空经济 → 低空经济(通达信概念) → {code}"}
+
+    r.conclusions.append({**base, "signal_id": "doc-3#1", "doc_id": "doc-3",
+                          "doc_title": "第三场会议", "source_url": "https://www.gov.cn/c.htm",
+                          "published_at": "2026-10-09",
+                          "tickers": [tk("600010", 6.0), tk("600011", 5.0)]})
+    events = cluster_events(r.conclusions, 5)
+    r.stats["global_top_codes"] = apply_global_pick_cap(events, 5)
+    r.events = events
+
+    md = render_markdown(r)
+    assert "未进入全局选股 Top-5" in md
+    assert "600010" not in md and "600011" not in md
+    assert "未进入全局选股 Top-5" in render_html(r)
+
+
+def _same_code_result() -> RunResult:
+    """两事件都命中 600003：A 里 90 分（全局最高）、B 里 60 分（应归 A，B 不得再列）。"""
+    from policypulse.clustering import apply_global_pick_cap, cluster_events
+
+    r = _result()
+    base = r.conclusions[0]
+    row = base["tickers"][0]
+
+    def tk(code: str, score: float) -> dict:
+        return {**row, "ticker_code": code, "ticker_name": f"测试{code}", "score": score,
+                "mapping_path": f"低空经济 → 低空经济(通达信概念) → {code}"}
+
+    r.conclusions = [
+        {**base, "signal_id": "doc-1#1", "doc_id": "doc-1", "doc_title": "会议A",
+         "source_url": "https://www.gov.cn/a.htm",
+         "tickers": [tk("600003", 90.0), tk("600001", 80.0), tk("600002", 70.0)]},
+        {**base, "signal_id": "doc-2#1", "doc_id": "doc-2", "doc_title": "另一场会议",
+         "source_url": "https://www.gov.cn/b.htm", "published_at": "2026-10-10",
+         "tickers": [tk("600003", 60.0), tk("600004", 50.0), tk("600005", 40.0)]},
+    ]
+    r.stats["global_max_picks"] = 5
+    events = cluster_events(r.conclusions, 5)
+    r.stats["global_top_codes"] = apply_global_pick_cap(events, 5)
+    r.events = events
+    return r
+
+
+def _md_table_codes(md: str) -> list[str]:
+    """md 个股表的代码列（第 1 单元格是序号、第 2 是 6 位代码）。"""
+    codes: list[str] = []
+    for line in md.splitlines():
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) >= 10 and cells[1].isdigit() and len(cells[2]) == 6 and cells[2].isdigit():
+            codes.append(cells[2])
+    return codes
+
+
+def test_same_code_in_two_events_is_listed_once():
+    """跨事件同码：md / html / json 每个码只出现一次，总行数 == 全局入选数。
+
+    这是渲染层最容易脱钩的场景——`caps.allowed` 是全日报共享的码集合，
+    600003 在事件 B 的 conclusions 里也有一份 60 分的行；不做「所有权交集」就会重复列出。
+    """
+    r = _same_code_result()
+    md = render_markdown(r)
+    codes = _md_table_codes(md)
+    assert len(codes) == 5, f"md 表格行数必须等于全局入选数，实际 {codes}"
+    assert sorted(codes) == ["600001", "600002", "600003", "600004", "600005"]
+    assert codes.count("600003") == 1, "同码只能在赢家事件表里出现一次"
+
+    winner_row = next(line for line in md.splitlines() if "| 600003 |" in line)
+    assert "| 90.0 |" in winner_row, "留下的是会议A 的 90 分那行，不是 B 的 60 分"
+    assert "| 全局入选个股（上限 5） | 5 |" in md, "概览数字必须与正文行数自洽"
+
+    out = render_html(r)
+    assert out.count("<td>600003</td>") == 1
+    assert out.count("<tr><td>") == 5, "html 表格行数必须等于全局入选数"
+
+    payload = json.loads(render_json(r))
+    shown = [t["ticker_code"] for e in payload["events"] for t in e["tickers"]]
+    assert len(shown) == 5 and shown.count("600003") == 1
+    scores = [t["score"] for e in payload["events"] for t in e["tickers"]
+              if t["ticker_code"] == "600003"]
+    assert scores == [90.0], "json 里 600003 只能是赢家那行"
+
+
+def test_same_code_events_keep_per_event_rows_when_global_cap_disabled():
+    """关闭全局截断（global_max_picks: 0）时不得取所有权交集：两事件各列自己那份。"""
+    r = _same_code_result()
+    r.stats["global_max_picks"] = 0
+    r.stats.pop("global_top_codes", None)
+    r.events = []
+
+    md = render_markdown(r)
+    codes = _md_table_codes(md)
+    assert len(codes) == 6, f"关闭口径应按每事件列出 6 行，实际 {codes}"
+    assert codes.count("600003") == 2, "关闭时两个事件各保留自己那一行"

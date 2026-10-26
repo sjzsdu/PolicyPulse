@@ -3,6 +3,10 @@
 score-v2：公司级相关性主导（≈0.5），市值流动性降为并列决胜位；
 排序键是 (score, relevance, 市值)，不再有「每板块 Top-N」的硬上限，
 而是先按全局相关性截断（min_relevance）再取 Top-N。
+
+选股硬上限（WAN-21）：Top-N 的 N 由 `settings.max_picks` 决定，默认 5。
+「先排序、再截断」——按打分（越高 = 相对上涨概率越大）降序排完才截断，
+候选不足时按实际数量返回，不做补位；返回结果保持降序。
 """
 
 from __future__ import annotations
@@ -46,11 +50,30 @@ def score_candidate(signal: Signal, cand: Candidate, breadth_norm: float,
     return round(min(1.0, raw) * 100, 2)
 
 
+def select_top(candidates: list[Candidate], limit: int) -> list[Candidate]:
+    """选股硬约束：先按打分降序排，再取前 `limit` 只。
+
+    - 排序键 `(-score, -relevance, -市值, ticker.code)`：前三位降序，末位 `code` **升序**
+      做确定性 tie-break——完全同分的两只不会随输入顺序（字典/集合序）漂移；
+    - score 越高 = 政策性上涨概率的相对值越大（本项目不产出概率数值，只输出相对排序）；
+    - 候选不足 `limit` 只时按实际数量返回，不补位；
+    - 返回结果保持降序，方便核对；
+    - `limit <= 0` 返回空列表（上限为 0 就是「一只都不选」，不隐式取消约束）。
+    """
+    ordered = sorted(
+        candidates,
+        key=lambda c: (-c.score, -(c.relevance or 0.0), -c.ticker.market_cap_yi,
+                       c.ticker.code),
+    )
+    return ordered[: max(limit, 0)]
+
+
 def rank(signal: Signal, candidates: list[Candidate], settings: Settings) -> list[Candidate]:
-    """全局相关性截断 + 加权打分排序。
+    """全局相关性截断 + 加权打分排序 + 5 只上限截断。
 
     板块内受益面广度按“该板块贡献的候选占全部候选比例”归一化；
     闸门不通过的候选相关性被压到 DEMOTE_CAP，会被 min_relevance 截断挡在正文之外。
+    截断发生在排序之后（见 select_top），返回的是分数最高的前 max_picks 只。
     """
     total = max(len(candidates), 1)
     per_sector: dict[str, int] = {}
@@ -66,8 +89,7 @@ def rank(signal: Signal, candidates: list[Candidate], settings: Settings) -> lis
         scored.append(cand)
 
     kept = [c for c in scored if c.relevance >= settings.min_relevance]
-    kept.sort(key=lambda c: (c.score, c.relevance, c.ticker.market_cap_yi), reverse=True)
-    return kept[: settings.max_tickers_per_signal]
+    return select_top(kept, settings.max_picks)
 
 
 def why_of(signal: Signal, cand: Candidate) -> str:

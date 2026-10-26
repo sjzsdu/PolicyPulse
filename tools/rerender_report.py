@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from policypulse.clustering import cluster_events  # noqa: E402
+from policypulse.clustering import apply_global_pick_cap, cluster_events  # noqa: E402
 from policypulse.config import default_paths, load_settings  # noqa: E402
 from policypulse.investability import assess_text  # noqa: E402
 from policypulse.pipeline import RunResult  # noqa: E402
@@ -98,7 +98,9 @@ def build_result(store: Store, run_id: str, settings):
         raise SystemExit(f"未找到 run {run_id}")
     docs = store.documents_for_run(run_id)
     signals, conclusions = build_conclusions_from_store(store, run_id, settings)
-    events = cluster_events(conclusions)
+    # 事件级 + 全局选股上限与线上链路同一口径：重渲染不得把 5 只上限放大回去
+    events = cluster_events(conclusions, settings.max_picks)
+    global_top_codes = apply_global_pick_cap(events, settings.global_max_picks)
     src_total = store.conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
     src_ok = src_total
     non_inv = [c for c in conclusions if not c["investable"]]
@@ -114,6 +116,9 @@ def build_result(store: Store, run_id: str, settings):
         "llm_enabled": False, "duplicates_skipped": 0, "out_of_window_docs": 0,
         "sources_no_update": [], "gate": {}, "deepdive_count": 0,
         "min_strength_for_report": settings.min_strength_for_report,
+        "max_picks": settings.max_picks,
+        "global_max_picks": settings.global_max_picks,
+        "global_top_codes": global_top_codes,
         "investable_gate": settings.investable_gate,
         "non_investable_signals": len(non_inv),
         "non_investable_signal_ids": [c["signal_id"] for c in non_inv],

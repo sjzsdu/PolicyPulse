@@ -181,6 +181,7 @@ sources.yaml 入口页
   → 板块成分股展开 → 过滤（ST、市值<30亿、北交所）
   → 公司级相关性闸门（data/theme_business.csv × F10 主营/营收构成）
   → 信号聚成政策事件 → 打分排序（相关性主导）→ 全局 min_relevance 截断
+  → 排序后取前 5 只（max_picks）→ 跨事件全局只剩前 5 只（global_max_picks）
   → Top-K 个股深度研读（需 LLM，无 key 跳过）→ 落库 → 出日报
 ```
 
@@ -241,6 +242,25 @@ Markdown 正文只收「利好 + 有板块映射 + `strength >= min_strength_for
 成为主导项**，市值流动性从 0.20 降到 0.10 且只作并列决胜位；**去掉了「每板块 Top-N
 （默认 5）」硬上限**，改为全局按 `min_relevance` 截断——排序是真正的从高到低，
 不再是「先按板块分组、组内按市值排」。
+
+### 选股上限 5 只（`max_picks` + `global_max_picks`，WAN-21）
+
+**整份日报全局最多 5 只**，而且**先排序、再截断**，不是展示层裁剪：
+
+- 信号级：`scoring.rank()` 打分 → 相关性截断 → `select_top(...)` 取前 `max_picks`（默认 5）；
+- 事件级：`clustering.cluster_events()` 把同一事件内多信号推的个股按代码去重、
+  按 score 降序排，再取前 `max_picks`；
+- 全局级：`clustering.apply_global_pick_cap()` 跨事件按代码去重（同码只留 **score 最高**
+  那次）、全局 score 降序排，再取前 `global_max_picks`（默认 5），并回写各事件 tickers——
+  md / html / json 三端都走这一份结果，json 不会和日报脱钩；
+- 排序键统一为 `(-score, -相关性, -市值, ticker.code)`，末位 `code` 升序做确定性
+  tie-break：完全同分的两只不会随字典/集合顺序漂移；
+- 候选不足上限时按实际数量返回，**不补位**；返回结果始终是 score 降序，
+  可以直接核对「留下的就是最高的 5 只」；
+- `score` 是政策受益度打分，本项目不产出概率数值，只把它当作相对上涨概率的排序代理；
+- 可回退：`policypulse.yaml` 里 `global_max_picks: 0` 关闭全局截断，退回「每个政策事件
+  各 `max_picks` 只」。`max_picks` 必须 ≥ 1（`global_max_picks` 的 0 是合法的关闭值）；
+  旧键 `max_tickers_per_signal` 会被迁移，且不会把上限放大回 5 以上。
 
 ### 公司级相关性闸门（`policypulse/relevance.py` + `profile.py`）
 
