@@ -163,6 +163,29 @@ def _restrict_tickers(conclusions: list[dict], allowed: set[str] | None) -> list
     ]
 
 
+def _event_allowed(caps: PickCaps, ev) -> set[str] | None:
+    """每事件的「所有权集」：全局允许集 ∩ 该事件回写后的个股码。
+
+    同码被一天内多个事件同时命中时，全局口径只保留 score 最高那行（归它所属的事件），
+    这条所有权只存在于回写后的 `ev.tickers` 里——渲染层从 conclusions 重算时必须再取一次
+    交集，否则另一个事件会用自己那份低分行把同一个码重新列出来（日报总行数超上限）。
+
+    `caps.allowed is None`（`global_max_picks: 0` 关闭）时原样透传 None，
+    不能拿 `ev.tickers` 反过来限制关闭口径。
+    """
+    if caps.allowed is None:
+        return None
+    return caps.allowed & {t.get("ticker_code", "") for t in ev.tickers}
+
+
+def _event_ticker_rows(ev, caps: PickCaps) -> list[dict]:
+    """该事件在 json 出口的个股行：按同一所有权口径过滤（events 已回写时幂等）。"""
+    allowed = _event_allowed(caps, ev)
+    if allowed is None:
+        return list(ev.tickers)
+    return [t for t in ev.tickers if t.get("ticker_code") in allowed]
+
+
 def _pick_caption(caps: PickCaps) -> str:
     """口径说明（md / html 共用一句，避免两端各写一套）。"""
     if caps.global_cap > 0:
@@ -181,7 +204,8 @@ def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: in
                   section: str, index: int, caps: PickCaps) -> None:
     # 先按全局允许集过滤，再按 score 降序去重、截断到事件上限——与逻辑层同一口径，
     # 渲染层不会因为「筛过一遍结论」把上限放大回去，也不会脱钩全局 Top-N
-    rows = merge_tickers(_restrict_tickers(qualifying, caps.allowed), caps.per_event)
+    rows = merge_tickers(_restrict_tickers(qualifying, _event_allowed(caps, ev)),
+                         caps.per_event)
     doc_count = len(ev.doc_ids)
     lines.append(f"### {index}. {ev.title}")
     lines.append("")
@@ -460,8 +484,7 @@ def render_json(result: RunResult) -> str:
                 "source_url": e.source_url, "doc_ids": e.doc_ids,
                 "signal_ids": [c["signal_id"] for c in e.conclusions],
                 # 全局允许集过滤（幂等）：events 已由逻辑层回写，这里再兜一层保证三端同口径
-                "tickers": [t for t in e.tickers
-                            if caps.allowed is None or t.get("ticker_code") in caps.allowed],
+                "tickers": _event_ticker_rows(e, caps),
                 # 反向分区：json 与 md/html 三端一致
                 "investable": bool([c for c in e.conclusions if c.get("investable", True)]),
                 "section": sections[e.event_id],
@@ -505,7 +528,8 @@ def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
     """单个事件的 HTML 段：与 md 的 _render_event 同一套分区与筛选口径。"""
     section = _event_section(ev, verdicts_by_event, totals_by_event)
     qualifying = _qualifying(ev, min_strength)
-    table_rows = merge_tickers(_restrict_tickers(qualifying, caps.allowed), caps.per_event)
+    table_rows = merge_tickers(_restrict_tickers(qualifying, _event_allowed(caps, ev)),
+                              caps.per_event)
     trows = "".join(
         f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
         f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
