@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from policypulse.clustering import cluster_events, merge_tickers
+from policypulse.clustering import apply_global_pick_cap, cluster_events, merge_tickers
 
 BASE = {
     "doc_id": "doc-1",
@@ -131,3 +131,68 @@ def test_merge_tickers_limit_truncates_after_sort():
         _c("s1", tickers=[_t("600001", 10.0), _t("600002", 90.0), _t("600003", 50.0)]),
     ], 2)
     assert [r["ticker_code"] for r in rows] == ["600002", "600003"]
+
+
+def _multi_events():
+    """两个政策事件，分数交叉：doc-1 = 10/20/30/40，doc-2 = 15/25/35/45。"""
+    return cluster_events([
+        _c("doc-1#1", doc_id="doc-1", tickers=_many("6000", 4)),
+        _c("doc-2#1", doc_id="doc-2", doc_title="另一条政策",
+           published_at="2026-10-18",
+           tickers=[_t(f"6001{i:02d}", 10.0 * i + 5) for i in range(1, 5)]),
+    ], max_picks=5)
+
+
+def test_global_cap_keeps_top_five_across_events():
+    """整份日报跨事件只留 score 最高的 5 只，并回写到各事件。"""
+    events = _multi_events()
+    assert sum(len(e.tickers) for e in events) == 8, "前置：两个事件共 8 只"
+
+    kept = apply_global_pick_cap(events, 5)
+
+    assert kept == ["600104", "600004", "600103", "600003", "600102"]
+    by_doc = {tuple(e.doc_ids): e for e in events}
+    assert [t["ticker_code"] for t in by_doc[("doc-1",)].tickers] == ["600004", "600003"]
+    assert [t["ticker_code"] for t in by_doc[("doc-2",)].tickers] == ["600104", "600103", "600102"]
+    assert sum(len(e.tickers) for e in events) == 5, "回写后全日报合计不得超过上限"
+
+
+def test_global_cap_zero_disables_global_truncation():
+    """global_max_picks=0 = 关闭全局截断，退回「每事件各 max_picks 只」。"""
+    events = _multi_events()
+    assert apply_global_pick_cap(events, 0) == []
+    assert sum(len(e.tickers) for e in events) == 8, "关闭时事件表不得被改动"
+
+
+def test_global_cap_dedupes_same_code_keeping_highest_score():
+    """跨事件同码只留一次，留 score 最高那次（不是最先出现那次）。"""
+    low = _c("doc-1#1", doc_id="doc-1", tickers=[_t("600001", 10.0), _t("600002", 20.0)])
+    high = _c("doc-2#1", doc_id="doc-2", doc_title="另一条政策", published_at="2026-10-18",
+              tickers=[_t("600001", 90.0)])
+    events = cluster_events([low, high], max_picks=5)
+
+    kept = apply_global_pick_cap(events, 5)
+
+    assert kept == ["600001", "600002"]
+    rows = [t for e in events for t in e.tickers if t["ticker_code"] == "600001"]
+    assert len(rows) == 1 and rows[0]["score"] == 90.0, "留下的必须是 score 最高那行"
+    by_doc = {tuple(e.doc_ids): e for e in events}
+    assert [t["ticker_code"] for t in by_doc[("doc-1",)].tickers] == ["600002"], \
+        "被更高分事件抢走的 600001 不该留在 doc-1 表里"
+
+
+def test_global_cap_tie_break_is_deterministic_by_code():
+    """同分时按 ticker.code 升序决胜，结果不随输入顺序漂移。"""
+    rows = [_t("600003", 50.0), _t("600001", 50.0), _t("600002", 50.0)]
+    events = cluster_events([_c("doc-1#1", tickers=rows)], max_picks=5)
+    # 事件内排序用同一个键：同分也按 code 升序（在全局截断之前先确认）
+    assert [t["ticker_code"] for t in events[0].tickers] == ["600001", "600002", "600003"]
+    assert apply_global_pick_cap(events, 2) == ["600001", "600002"]
+
+
+def test_shared_row_sort_key_ignores_input_order():
+    """同一批行换个输入顺序，全局选股结果必须一致。"""
+    rows = [_t("600002", 50.0), _t("600001", 50.0), _t("600003", 50.0)]
+    a = cluster_events([_c("doc-1#1", tickers=rows)], max_picks=5)
+    b = cluster_events([_c("doc-1#1", tickers=list(reversed(rows)))], max_picks=5)
+    assert apply_global_pick_cap(a, 2) == apply_global_pick_cap(b, 2) == ["600001", "600002"]

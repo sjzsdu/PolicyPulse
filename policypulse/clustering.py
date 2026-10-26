@@ -51,6 +51,18 @@ def _event_id(doc_ids: list[str]) -> str:
     return "evt-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
 
 
+def _row_sort_key(row: dict) -> tuple[float, str]:
+    """个股行的确定性排序键：score 降序、同分按 `ticker_code` 升序 tie-break。
+
+    全局排序键与事件内排序共用这一个键，保证同分结果不随字典/集合顺序漂移。
+    """
+    try:
+        score = float(row.get("score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return (-score, str(row.get("ticker_code", "")))
+
+
 def _merge_tickers(conclusions: list[dict], limit: int | None = None) -> list[dict]:
     """同一事件里重复出现的个股只留一条，保留最高分那条，并记录推导信号。
 
@@ -89,7 +101,7 @@ def _merge_tickers(conclusions: list[dict], limit: int | None = None) -> list[di
         row.pop("_signal_ids", None)
         row["signal_ids"] = list(best[code].get("_signal_ids", []))
         rows.append(row)
-    rows.sort(key=lambda r: r.get("score", 0), reverse=True)
+    rows.sort(key=_row_sort_key)
     if limit is not None:
         rows = rows[: max(limit, 0)]
     return rows
@@ -151,6 +163,41 @@ def cluster_events(conclusions: list[dict], max_picks: int | None = None) -> lis
     return merged
 
 
+def apply_global_pick_cap(events: list[PolicyEvent], limit: int) -> list[str]:
+    """全局选股上限：整份日报跨事件合计只留 score 最高的前 `limit` 只个股。
+
+    - 跨事件同码只留一次，保留 **score 最高**那一次（并列时按 ticker.code 决胜），
+      不是「最先出现」那次；
+    - 全局排序键复用 score，末位 `ticker_code` 做确定性 tie-break（见 _row_sort_key）；
+    - 截断后把各事件的 `tickers` 回写成允许集内的行（事件内原有顺序不变），
+      因此 JSON 出口自动同口径，不需要渲染层再算一次；
+    - `limit <= 0` = 关闭全局截断（退回「每个事件各 max_picks 只」），
+      此时不改动 events 并返回空列表；调用方按该值判断是否启用过滤；
+    - 返回被保留的代码列表（全局 score 降序），供 md/html 按允许集过滤。
+    """
+    if limit <= 0:
+        return []
+
+    # code -> 该码 score 最高的那一行（行对象本身，用来跨事件定位）
+    best: dict[str, dict] = {}
+    for ev in events:
+        for row in ev.tickers:
+            code = row.get("ticker_code", "")
+            if not code:
+                continue
+            prev = best.get(code)
+            if prev is None or _row_sort_key(row) < _row_sort_key(prev):
+                best[code] = row
+
+    ranked = sorted(best.values(), key=_row_sort_key)
+    winners = ranked[:limit]
+    keep_ids = {id(row) for row in winners}
+    # 按「行身份」回写：同码只留在胜出行所属的那个事件里，别的事件不再重复出现
+    for ev in events:
+        ev.tickers = [row for row in ev.tickers if id(row) in keep_ids]
+    return [row["ticker_code"] for row in winners]
+
+
 def event_stats(events: list[PolicyEvent]) -> dict:    return {
         "events": len(events),
         "conclusions": sum(len(e.conclusions) for e in events),
@@ -170,9 +217,14 @@ def merge_tickers(conclusions: list[dict], limit: int | None = None) -> list[dic
 def _ensure_events(result) -> list[PolicyEvent]:
     """RunResult 带 events 就用；否则（单测/历史对象）从 conclusions 现算一次。
 
-    现算时同样应用选股上限：stats 里带 max_picks 就用它，老对象回落到 Settings 默认值。
+    现算时同样应用两级选股上限：事件内 max_picks + 跨事件 global_max_picks；
+    stats 里带这两个键就用它，老对象回落到 Settings 默认值。
     """
+    stats = getattr(result, "stats", None) or {}
     if getattr(result, "events", None):
         return result.events
-    limit = (getattr(result, "stats", None) or {}).get("max_picks", Settings.max_picks)
-    return cluster_events(result.conclusions, int(limit))
+    events = cluster_events(result.conclusions,
+                            int(stats.get("max_picks", Settings.max_picks)))
+    apply_global_pick_cap(events,
+                          int(stats.get("global_max_picks", Settings.global_max_picks)))
+    return events

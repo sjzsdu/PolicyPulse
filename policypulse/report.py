@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from policypulse.clustering import _ensure_events, merge_tickers
@@ -124,15 +125,63 @@ def _event_section(ev, verdicts_by_event: dict[str, list[bool]],
     return SECTION_CONCEPT_ONLY
 
 
+@dataclass(frozen=True)
+class PickCaps:
+    """选股上限口径（WAN-21）：事件内上限 + 全局上限（0=关闭）+ 全局允许集（None=不过滤）。"""
+
+    per_event: int
+    global_cap: int
+    allowed: set[str] | None
+
+
+def pick_caps(stats: dict, events: list) -> PickCaps:
+    """从 stats 读出口径；老对象/老报告缺键时回落 Settings 默认值并从 events 反推允许集。
+
+    `allowed=None` 表示不做全局过滤（`global_max_picks=0` 关闭时，或拿不到事件时）。
+    允许集为空集合则表示「本份日报一只都没入选」，此时所有事件表都为空。
+    """
+    global_cap = int(stats.get("global_max_picks", Settings.global_max_picks))
+    per_event = int(stats.get("max_picks", Settings.max_picks))
+    if global_cap <= 0:
+        return PickCaps(per_event=per_event, global_cap=0, allowed=None)
+    raw = stats.get("global_top_codes")
+    if raw is None:
+        # 老对象（stats 里没有全局口径）：events 已被 _ensure_events 按同一口径截断，
+        # 用它们的并集当允许集，md/html/json 就不会和 json 的 events 脱钩
+        raw = sorted({t.get("ticker_code", "") for e in events for t in e.tickers} - {""})
+    return PickCaps(per_event=per_event, global_cap=global_cap, allowed=set(raw))
+
+
+def _restrict_tickers(conclusions: list[dict], allowed: set[str] | None) -> list[dict]:
+    """按全局允许集过滤个股行——在去重/截断之前过滤，低分行绝不会因先截断被漏掉。"""
+    if allowed is None:
+        return conclusions
+    return [
+        {**c, "tickers": [t for t in c.get("tickers", [])
+                          if t.get("ticker_code") in allowed]}
+        for c in conclusions
+    ]
+
+
+def _pick_caption(caps: PickCaps) -> str:
+    """口径说明（md / html 共用一句，避免两端各写一套）。"""
+    if caps.global_cap > 0:
+        return (f"选股上限：整份日报全局最多 {caps.global_cap} 只——跨事件按代码去重、"
+                f"按 score（越高 = 相对上涨概率越大）降序取前 {caps.global_cap}；"
+                f"事件内不超过 {caps.per_event} 只，候选不足按实际数量列出，不补位。")
+    return (f"选股上限：全局截断已关闭（`global_max_picks: 0`），每个政策事件按 score "
+            f"降序最多列 {caps.per_event} 只；候选不足按实际数量列出，不补位。")
+
+
 def _qualifying(ev, min_strength: int) -> list[dict]:
     return [c for c in ev.conclusions if _is_bullish(c, min_strength)]
 
 
 def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: int,
-                  section: str, index: int, max_picks: int) -> None:
-    # 事件内个股先按 score 降序去重、再截断到 max_picks：与逻辑层同一口径，
-    # 渲染层不会因为「筛过一遍结论」而把上限放大回去
-    rows = merge_tickers(qualifying, max_picks)
+                  section: str, index: int, caps: PickCaps) -> None:
+    # 先按全局允许集过滤，再按 score 降序去重、截断到事件上限——与逻辑层同一口径，
+    # 渲染层不会因为「筛过一遍结论」把上限放大回去，也不会脱钩全局 Top-N
+    rows = merge_tickers(_restrict_tickers(qualifying, caps.allowed), caps.per_event)
     doc_count = len(ev.doc_ids)
     lines.append(f"### {index}. {ev.title}")
     lines.append("")
@@ -159,6 +208,10 @@ def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: in
         lines.append("")
         lines.append(f"> {c['quote']}")
         lines.append("")
+    if not rows:
+        lines.append(f"- 个股：本事件个股未进入全局选股 Top-{caps.global_cap}，不列个股表。")
+        lines.append("")
+        return
     lines.append("| # | 代码 | 名称 | 板块 | 市值(亿) | score | 相关性 | 受益理由 | 映射路径 |")
     lines.append("|---|---|---|---|---|---|---|---|---|")
     for i, t in enumerate(rows, start=1):
@@ -205,8 +258,8 @@ def _source_links(c: dict) -> str:
 def render_markdown(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
-    max_picks = int(s.get("max_picks", Settings.max_picks))
     events = _ensure_events(result)
+    caps = pick_caps(s, events)
     lines: list[str] = []
     lines.append(f"# PolicyPulse 日报 {result.window_end}")
     lines.append("")
@@ -228,6 +281,9 @@ def render_markdown(result: RunResult) -> str:
     lines.append(f"| 信号级可投资性闸门 | "
                  f"{'关闭（全部按可投资处理）' if gate_off else f'非投资信号 {non_inv} 条'} |")
     lines.append(f"| 个股结论行数（事件内去重后） | {s['ticker_rows']} |")
+    if caps.global_cap > 0:
+        lines.append(f"| 全局入选个股（上限 {caps.global_cap}） | "
+                     f"{len(caps.allowed or set())} |")
     lines.append(f"| 信息源（可用/总数） | {s.get('sources_ok', 0)} / {s['sources_total']} |")
     lines.append(f"| 抓取失败条目 | {s.get('fetch_failures', 0)} |")
     lines.append(f"| 跨 run 去重跳过 | {s.get('duplicates_skipped', 0)} |")
@@ -303,8 +359,7 @@ def render_markdown(result: RunResult) -> str:
 
     lines.append("## 受益个股")
     lines.append("")
-    lines.append(f"> 选股上限：每个政策事件按 score（越高 = 相对上涨概率越大）降序，"
-                 f"只列前 {max_picks} 只；候选不足 {max_picks} 只时按实际数量列出，不补位。")
+    lines.append(f"> {_pick_caption(caps)}")
     lines.append("")
     if filtered_out:
         lines.append(f"另有 {filtered_out} 条利好结论力度 < {min_strength}，未列入本表，详见同名 JSON 与数据库。")
@@ -318,21 +373,21 @@ def render_markdown(result: RunResult) -> str:
         lines.append("")
     for i, ev in enumerate(main_events, start=1):
         _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                      sections[ev.event_id], i, max_picks)
+                      sections[ev.event_id], i, caps)
 
     if concept_events:
         lines.append("## 仅概念关联（深读判定无实质传导，不授予受益头衔）")
         lines.append("")
         for i, ev in enumerate(concept_events, start=1):
             _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                          sections[ev.event_id], i, max_picks)
+                          sections[ev.event_id], i, caps)
 
     if pending_events:
         lines.append("## 待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）")
         lines.append("")
         for i, ev in enumerate(pending_events, start=1):
             _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                          sections[ev.event_id], i, max_picks)
+                          sections[ev.event_id], i, caps)
 
     lines.extend(_non_investable_lines(result.conclusions))
 
@@ -387,6 +442,7 @@ def render_json(result: RunResult) -> str:
     verdicts = _verdicts_by_event(deepdives)
     totals = _totals_by_event(deepdives)
     events = _ensure_events(result)
+    caps = pick_caps(result.stats, events)
     sections = {ev.event_id: _event_section(ev, verdicts, totals) for ev in events}
     pending_ids = [e.event_id for e in events
                    if sections[e.event_id] == SECTION_CONCEPT_PENDING]
@@ -403,7 +459,9 @@ def render_json(result: RunResult) -> str:
                 "meeting_type": e.meeting_type, "published_at": e.published_at,
                 "source_url": e.source_url, "doc_ids": e.doc_ids,
                 "signal_ids": [c["signal_id"] for c in e.conclusions],
-                "tickers": e.tickers,
+                # 全局允许集过滤（幂等）：events 已由逻辑层回写，这里再兜一层保证三端同口径
+                "tickers": [t for t in e.tickers
+                            if caps.allowed is None or t.get("ticker_code") in caps.allowed],
                 # 反向分区：json 与 md/html 三端一致
                 "investable": bool([c for c in e.conclusions if c.get("investable", True)]),
                 "section": sections[e.event_id],
@@ -443,11 +501,11 @@ def render_json(result: RunResult) -> str:
 
 def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
                 totals_by_event: dict[str, int] | None, min_strength: int,
-                max_picks: int) -> str:
+                caps: PickCaps) -> str:
     """单个事件的 HTML 段：与 md 的 _render_event 同一套分区与筛选口径。"""
     section = _event_section(ev, verdicts_by_event, totals_by_event)
     qualifying = _qualifying(ev, min_strength)
-    table_rows = merge_tickers(qualifying, max_picks)
+    table_rows = merge_tickers(_restrict_tickers(qualifying, caps.allowed), caps.per_event)
     trows = "".join(
         f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
         f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
@@ -455,6 +513,13 @@ def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
         f"<td>{_esc(t['why'])}</td>"
         f"<td><a href='{_esc(ev.source_url)}' target='_blank'>原文</a></td></tr>"
         for i, t in enumerate(table_rows, start=1)
+    )
+    table_html = (
+        "<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
+        "<th>score</th><th>相关性</th><th>理由</th><th>溯源</th></tr></thead>"
+        f"<tbody>{trows}</tbody></table>"
+        if table_rows else
+        f"<p class='meta'>本事件个股未进入全局选股 Top-{caps.global_cap}，不列个股表。</p>"
     )
     sigs = "".join(
         f"<h4><code>{_esc(c['signal_id'])}</code> {_esc(c['summary'])}</h4>"
@@ -470,9 +535,7 @@ def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
         f"{_esc(ev.org)} · {_esc(ev.meeting_type)} · "
         f"{_esc(ev.published_at)} · 合并 {len(ev.doc_ids)} 篇文档 · 信号 {len(ev.conclusions)} 条</p>"
         f"{sigs}"
-        f"<table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th><th>市值(亿)</th>"
-        f"<th>score</th><th>相关性</th><th>理由</th><th>溯源</th></tr></thead>"
-        f"<tbody>{trows}</tbody></table></section>"
+        f"{table_html}</section>"
     )
 
 
@@ -494,7 +557,7 @@ def _non_investable_html(conclusions: list[dict]) -> str:
     )
 
 
-def _sections_html(result, events, min_strength: int, max_picks: int) -> str:
+def _sections_html(result, events, min_strength: int, caps: PickCaps) -> str:
     """HTML 的分区，与 md / json 使用同一套 _event_section 判定。"""
     deepdives = list(getattr(result, "deepdives", None) or [])
     verdicts = _verdicts_by_event(deepdives)
@@ -508,21 +571,20 @@ def _sections_html(result, events, min_strength: int, max_picks: int) -> str:
                       if sections[ev.event_id] == SECTION_CONCEPT_PENDING and _qualifying(ev, min_strength)]
 
     parts = ["<h2>受益个股</h2>",
-             f"<p class='meta'>选股上限：每个政策事件按 score（越高 = 相对上涨概率越大）"
-             f"降序只列前 {max_picks} 只；不足按实际数量列出，不补位。</p>"]
+             f"<p class='meta'>{_esc(_pick_caption(caps))}</p>"]
     if main_events:
-        parts.extend(_event_html(ev, verdicts, totals, min_strength, max_picks)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength, caps)
                      for ev in main_events)
     else:
         parts.append("<p><strong>今日无实质投资信号</strong>：没有深读明判「有实质影响」"
                      "的政策事件。下面是仅概念关联、待判定与非投资信号留痕。</p>")
     if concept_events:
         parts.append("<h2>仅概念关联（深读判定无实质传导，不授予受益头衔）</h2>")
-        parts.extend(_event_html(ev, verdicts, totals, min_strength, max_picks)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength, caps)
                      for ev in concept_events)
     if pending_events:
         parts.append("<h2>待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）</h2>")
-        parts.extend(_event_html(ev, verdicts, totals, min_strength, max_picks)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength, caps)
                      for ev in pending_events)
     parts.append(_non_investable_html(result.conclusions))
     return "".join(parts)
@@ -531,8 +593,8 @@ def _sections_html(result, events, min_strength: int, max_picks: int) -> str:
 def render_html(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
-    max_picks = int(s.get("max_picks", Settings.max_picks))
     events = _ensure_events(result)
+    caps = pick_caps(s, events)
     non_investable = [c for c in result.conclusions if not c.get("investable", True)]
 
     compliance = ""
@@ -554,7 +616,7 @@ def render_html(result: RunResult) -> str:
             body = (f"<p><strong>{_esc(EMPTY_DAY_NOTICE)}</strong>（窗口 "
                     f"{_esc(result.window_start)} ~ {_esc(result.window_end)}）</p>")
     else:
-        body = _sections_html(result, events, min_strength, max_picks)
+        body = _sections_html(result, events, min_strength, caps)
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PolicyPulse 日报 {_esc(result.window_end)}</title>
@@ -574,7 +636,7 @@ th{{background:#f5f5f5}}
 <p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
 <p class="caveat">{_esc(INVESTABLE_CAVEAT)}</p>
 <p class="caveat">{_esc(GATE_CAVEAT)}</p>
-<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 事件 {s.get('events', len(events))} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 非投资信号 {len(non_investable)} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
+<p>窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 文档 {s['docs']} · 事件 {s.get('events', len(events))} · 信号 {s['signals']} · 个股结论 {s['ticker_rows']} · 全局入选 {len(caps.allowed or set()) if caps.global_cap > 0 else s['ticker_rows']} · 非投资信号 {len(non_investable)} · 央行相关 {s.get('pbc_related_docs', 0)}</p>
 {body}
 {compliance}
 <p class="disc">{_esc(DISCLAIMER)}</p>

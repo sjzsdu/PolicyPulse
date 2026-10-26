@@ -28,6 +28,10 @@ exclude_bj: true
 # 候选不足时按实际数量返回，不补位。信号级与事件级共用这一上限。
 # 旧键 max_tickers_per_signal 已改名（老配置会被迁移，且不会把上限放大回 5 以上）。
 max_picks: 5
+# 整份日报的全局选股上限（WAN-21 v2）：跨事件按代码去重（同码留 score 最高那次）、
+# 全局 score 降序后整体只留前 global_max_picks 只。
+# 显式置 0 = 关闭全局截断，退回「每个政策事件各 max_picks 只」的可回退开关。
+global_max_picks: 5
 deepdive_top_k: 3                # 个股深度研读取 Top-K；需要 LLM，未配置则整段跳过
 
 request_timeout: 25.0

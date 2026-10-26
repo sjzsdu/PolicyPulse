@@ -53,7 +53,8 @@ def score_candidate(signal: Signal, cand: Candidate, breadth_norm: float,
 def select_top(candidates: list[Candidate], limit: int) -> list[Candidate]:
     """选股硬约束：先按打分降序排，再取前 `limit` 只。
 
-    - 排序键 (score, relevance, 市值) 与 rank() 完全一致，保证「取的是最高的 N 只」；
+    - 排序键 `(-score, -relevance, -市值, ticker.code)`：前三位降序，末位 `code` **升序**
+      做确定性 tie-break——完全同分的两只不会随输入顺序（字典/集合序）漂移；
     - score 越高 = 政策性上涨概率的相对值越大（本项目不产出概率数值，只输出相对排序）；
     - 候选不足 `limit` 只时按实际数量返回，不补位；
     - 返回结果保持降序，方便核对；
@@ -61,8 +62,8 @@ def select_top(candidates: list[Candidate], limit: int) -> list[Candidate]:
     """
     ordered = sorted(
         candidates,
-        key=lambda c: (c.score, c.relevance, c.ticker.market_cap_yi),
-        reverse=True,
+        key=lambda c: (-c.score, -(c.relevance or 0.0), -c.ticker.market_cap_yi,
+                       c.ticker.code),
     )
     return ordered[: max(limit, 0)]
 

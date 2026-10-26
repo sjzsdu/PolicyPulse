@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from policypulse import llm
-from policypulse.clustering import PolicyEvent, cluster_events
+from policypulse.clustering import PolicyEvent, apply_global_pick_cap, cluster_events
 from policypulse.config import (
     DISCLAIMER,
     REPO_ROOT,
@@ -569,6 +569,10 @@ def run(settings: Settings, paths, target_date: date | None = None,
     # 事件聚类：同文档 / 同发布会的信号聚成一个政策事件，个股按代码去重；
     # 事件级个股同样先按 score 降序再截断到 max_picks（WAN-21 的 5 只硬上限）
     events = cluster_events(conclusions, settings.max_picks)
+    # 全局选股上限：跨事件按代码去重（同码留 score 最高那次）、全局 score 降序，
+    # 整体只留前 global_max_picks 只，并回写各事件 tickers；0 = 关闭，退回每事件口径。
+    # 深读必须在这之后调用，才会消费到 ≤5 的池。
+    global_top_codes = apply_global_pick_cap(events, settings.global_max_picks)
     # 个股深度研读：可插拔模块，无 LLM 时整段跳过并写明原因
     dives, deepdive_notes = build_deepdives(events, client, settings)
     warnings.extend(deepdive_notes)
@@ -626,6 +630,9 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "min_strength_for_report": settings.min_strength_for_report,
         # 选股上限口径：报告层用它保持与逻辑层一致的截断（WAN-21）
         "max_picks": settings.max_picks,
+        "global_max_picks": settings.global_max_picks,
+        # 全局入选代码（score 降序）；global_max_picks=0（关闭）时为空列表
+        "global_top_codes": global_top_codes,
         "tongstock_calls": client.calls,
         "llm_enabled": llm.llm_available(),
         "disclaimer": DISCLAIMER,

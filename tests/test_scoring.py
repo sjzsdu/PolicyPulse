@@ -127,3 +127,12 @@ def test_why_is_short_and_distinct():
     cand = _cand("600001", 500.0)
     assert len(why_of(_sig(), cand)) <= 40
     assert "低空经济" in why_of(_sig(), cand)
+
+
+def test_select_top_tie_break_is_stable_by_code():
+    """完全同分时按 ticker.code 升序决胜，结果不随输入顺序漂移。"""
+    cands = [_cand(code, 500.0) for code in ("600003", "600001", "600002")]
+    for cand in cands:
+        cand.score = 50.0
+    assert [c.ticker.code for c in select_top(cands, 2)] == ["600001", "600002"]
+    assert [c.ticker.code for c in select_top(list(reversed(cands)), 2)] == ["600001", "600002"]

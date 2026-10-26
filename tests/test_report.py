@@ -241,3 +241,100 @@ def test_json_event_tickers_is_capped_at_five_picks():
     payload = json.loads(render_json(_with_many_tickers(8)))
     tickers = payload["events"][0]["tickers"]
     assert [t["ticker_code"] for t in tickers] == [f"6000{i:02d}" for i in range(1, 6)]
+
+
+def _multi_event_result(global_cap: int = 5) -> RunResult:
+    """两个政策事件各 3 只（分数交叉），用于核对整份日报的全局上限。"""
+    r = _result()
+    base = r.conclusions[0]
+    row = base["tickers"][0]
+
+    def tk(code: str, score: float) -> dict:
+        return {**row, "ticker_code": code, "ticker_name": f"测试{code}", "score": score,
+                "mapping_path": f"低空经济 → 低空经济(通达信概念) → {code}"}
+
+    r.conclusions = [
+        {**base, "signal_id": "doc-1#1", "doc_id": "doc-1",
+         "tickers": [tk("600001", 10.0), tk("600002", 20.0), tk("600003", 30.0)]},
+        {**base, "signal_id": "doc-2#1", "doc_id": "doc-2", "doc_title": "另一场会议",
+         "source_url": "https://www.gov.cn/b.htm", "published_at": "2026-10-10",
+         "tickers": [tk("600004", 15.0), tk("600005", 25.0), tk("600006", 35.0)]},
+    ]
+    r.stats["global_max_picks"] = global_cap
+    return r
+
+
+CODES = ["600001", "600002", "600003", "600004", "600005", "600006"]
+
+
+def _shown(text: str) -> list[str]:
+    return [code for code in CODES if code in text]
+
+
+def test_multi_event_report_total_is_capped_at_five():
+    """一天多事件时整份日报的个股总数 ≤5，留下的是全局 score 最高的 5 只。"""
+    r = _multi_event_result()
+    md = render_markdown(r)
+    shown = _shown(md)
+    assert len(shown) == 5, f"md 里个股数必须 <= 5，实际 {shown}"
+    for code in ("600006", "600003", "600005", "600002", "600004"):
+        assert code in md, f"全局前 5 名里的 {code} 必须出现"
+    assert "600001" not in md, "分数最低的 600001 不该挤进全局 Top-5"
+    assert "| 全局入选个股（上限 5） | 5 |" in md, "概览要给可核对的全局入选数"
+
+    out = render_html(r)
+    assert len(_shown(out)) == 5 and "600001" not in out
+
+    payload = json.loads(render_json(r))
+    shown = [t["ticker_code"] for e in payload["events"] for t in e["tickers"]]
+    assert len(shown) == 5 and "600001" not in shown
+
+
+def test_multi_event_report_falls_back_when_global_cap_disabled():
+    """global_max_picks=0 = 关闭：退回每事件口径，两个事件各 3 只都能出现。"""
+    r = _multi_event_result(global_cap=0)
+    md = render_markdown(r)
+    assert len(_shown(md)) == 6, f"关闭后应按每事件口径列出：{_shown(md)}"
+    assert "全局截断已关闭" in md
+
+
+def test_pipeline_style_result_stays_capped_globally():
+    """线上路径：events 已由 pipeline 回写、stats 带 global_top_codes —— 三端仍是 ≤5。"""
+    from policypulse.clustering import apply_global_pick_cap, cluster_events
+
+    r = _multi_event_result()
+    events = cluster_events(r.conclusions, 5)
+    r.stats["global_top_codes"] = apply_global_pick_cap(events, 5)
+    r.events = events
+
+    md = render_markdown(r)
+    assert len(_shown(md)) == 5, f"md 里的个股数必须 <= 5，实际 {_shown(md)}"
+    payload = json.loads(render_json(r))
+    assert sum(len(e["tickers"]) for e in payload["events"]) == 5
+    assert len(_shown(render_html(r))) == 5
+
+
+def test_event_with_all_picks_cut_shows_notice_instead_of_empty_table():
+    """某个事件的个股全被全局裁掉时，日报给一行说明，不留空表。"""
+    from policypulse.clustering import apply_global_pick_cap, cluster_events
+
+    r = _multi_event_result()
+    base = r.conclusions[0]
+
+    def tk(code: str, score: float) -> dict:
+        return {**base["tickers"][0], "ticker_code": code, "ticker_name": f"测试{code}",
+                "score": score,
+                "mapping_path": f"低空经济 → 低空经济(通达信概念) → {code}"}
+
+    r.conclusions.append({**base, "signal_id": "doc-3#1", "doc_id": "doc-3",
+                          "doc_title": "第三场会议", "source_url": "https://www.gov.cn/c.htm",
+                          "published_at": "2026-10-09",
+                          "tickers": [tk("600010", 6.0), tk("600011", 5.0)]})
+    events = cluster_events(r.conclusions, 5)
+    r.stats["global_top_codes"] = apply_global_pick_cap(events, 5)
+    r.events = events
+
+    md = render_markdown(r)
+    assert "未进入全局选股 Top-5" in md
+    assert "600010" not in md and "600011" not in md
+    assert "未进入全局选股 Top-5" in render_html(r)
