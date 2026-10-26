@@ -12,6 +12,8 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 
+from policypulse.config import Settings
+
 # 同机构同日、标题相似度 ≥ 该阈值视为同一次发布（通稿全文 + 新闻稿两种版本）
 TITLE_SIMILARITY = 0.7
 _WS_RE = re.compile(r"\s+")
@@ -49,11 +51,14 @@ def _event_id(doc_ids: list[str]) -> str:
     return "evt-" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]
 
 
-def _merge_tickers(conclusions: list[dict]) -> list[dict]:
+def _merge_tickers(conclusions: list[dict], limit: int | None = None) -> list[dict]:
     """同一事件里重复出现的个股只留一条，保留最高分那条，并记录推导信号。
 
     信号归属要在**被保留的那条**上累积：如果只在传入的 dict 上挂 id，
     后来的低分行被丢弃时它的信号号也一起丢了。
+
+    `limit`：选股硬上限（WAN-21）。去重结果已按 score 降序，截断就发生在排序之后——
+    留下的是分数最高的前 limit 只；候选不足时按实际数量返回，不补位。
     """
     best: dict[str, dict] = {}
     order: list[str] = []
@@ -85,11 +90,17 @@ def _merge_tickers(conclusions: list[dict]) -> list[dict]:
         row["signal_ids"] = list(best[code].get("_signal_ids", []))
         rows.append(row)
     rows.sort(key=lambda r: r.get("score", 0), reverse=True)
+    if limit is not None:
+        rows = rows[: max(limit, 0)]
     return rows
 
 
-def cluster_events(conclusions: list[dict]) -> list[PolicyEvent]:
-    """把结论聚成政策事件；返回按 (日期, 得分) 排序的事件列表。"""
+def cluster_events(conclusions: list[dict], max_picks: int | None = None) -> list[PolicyEvent]:
+    """把结论聚成政策事件；返回按 (日期, 得分) 排序的事件列表。
+
+    `max_picks`：事件级选股上限（WAN-21）。事件内的个股先按代码去重、按 score 降序排，
+    再截断到前 max_picks 只——一次选股最多就这么多，不靠展示层裁剪。
+    """
     by_doc: dict[str, list[dict]] = {}
     for c in conclusions:
         by_doc.setdefault(c.get("doc_id", ""), []).append(c)
@@ -132,7 +143,7 @@ def cluster_events(conclusions: list[dict]) -> list[PolicyEvent]:
 
     for ev in merged:
         ev.event_id = _event_id(ev.doc_ids)
-        ev.tickers = _merge_tickers(ev.conclusions)
+        ev.tickers = _merge_tickers(ev.conclusions, max_picks)
         ev.conclusions.sort(key=lambda c: (-c.get("strength", 0), -c.get("confidence", 0)))
 
     merged.sort(key=lambda e: ((e.published_at or "")[:10], -max(
@@ -148,13 +159,20 @@ def event_stats(events: list[PolicyEvent]) -> dict:    return {
     }
 
 
-def merge_tickers(conclusions: list[dict]) -> list[dict]:
-    """公开别名：渲染层用它对「已筛过的结论」做同一套个股去重。"""
-    return _merge_tickers(conclusions)
+def merge_tickers(conclusions: list[dict], limit: int | None = None) -> list[dict]:
+    """公开别名：渲染层用它对「已筛过的结论」做同一套个股去重。
+
+    `limit` 与 cluster_events 的 max_picks 同义：排序后再截断，渲染层不会看到超过上限的表。
+    """
+    return _merge_tickers(conclusions, limit)
 
 
 def _ensure_events(result) -> list[PolicyEvent]:
-    """RunResult 带 events 就用；否则（单测/历史对象）从 conclusions 现算一次。"""
+    """RunResult 带 events 就用；否则（单测/历史对象）从 conclusions 现算一次。
+
+    现算时同样应用选股上限：stats 里带 max_picks 就用它，老对象回落到 Settings 默认值。
+    """
     if getattr(result, "events", None):
         return result.events
-    return cluster_events(result.conclusions)
+    limit = (getattr(result, "stats", None) or {}).get("max_picks", Settings.max_picks)
+    return cluster_events(result.conclusions, int(limit))

@@ -566,8 +566,9 @@ def run(settings: Settings, paths, target_date: date | None = None,
         store.finish_run(run_id, "failed", len(docs), 0, 0, notes=f"tongstock: {exc}")
         raise
 
-    # 事件聚类：同文档 / 同发布会的信号聚成一个政策事件，个股按代码去重
-    events = cluster_events(conclusions)
+    # 事件聚类：同文档 / 同发布会的信号聚成一个政策事件，个股按代码去重；
+    # 事件级个股同样先按 score 降序再截断到 max_picks（WAN-21 的 5 只硬上限）
+    events = cluster_events(conclusions, settings.max_picks)
     # 个股深度研读：可插拔模块，无 LLM 时整段跳过并写明原因
     dives, deepdive_notes = build_deepdives(events, client, settings)
     warnings.extend(deepdive_notes)
@@ -623,6 +624,8 @@ def run(settings: Settings, paths, target_date: date | None = None,
         "pbc_related_sources": sorted({d.source_id for d in docs if is_pbc_related(d.title, d.body)}),
         "sources_detail": source_rows,
         "min_strength_for_report": settings.min_strength_for_report,
+        # 选股上限口径：报告层用它保持与逻辑层一致的截断（WAN-21）
+        "max_picks": settings.max_picks,
         "tongstock_calls": client.calls,
         "llm_enabled": llm.llm_available(),
         "disclaimer": DISCLAIMER,

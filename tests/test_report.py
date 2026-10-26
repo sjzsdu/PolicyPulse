@@ -206,3 +206,38 @@ def test_report_carries_the_per_source_compliance_ledger():
 
     payload = json.loads(render_json(_with_compliance(_result())))
     assert payload["stats"]["sources_detail"][0]["robots"] == "allowed"
+
+
+def _with_many_tickers(n: int = 8) -> RunResult:
+    """一只事件里塞 n 只个股（score 递减），用于核对报告层的选股上限。"""
+    r = _result()
+    base = dict(r.conclusions[0]["tickers"][0])
+    r.conclusions[0]["tickers"] = [
+        {**base, "ticker_code": f"6000{i:02d}", "ticker_name": f"测试{i}", "score": 90.0 - i}
+        for i in range(1, n + 1)
+    ]
+    return r
+
+
+def test_markdown_event_table_is_capped_at_five_picks():
+    """5 只上限在报告里同样生效：留下的是 score 最高的 5 只，低分的不出现。"""
+    md = render_markdown(_with_many_tickers(8))
+    for i in range(1, 6):
+        assert f"6000{i:02d}" in md, f"前 5 只里的 6000{i:02d} 必须出现"
+    for i in range(6, 9):
+        assert f"6000{i:02d}" not in md, f"6000{i:02d} 分数更低，不该出现在日报里"
+    assert "选股上限" in md
+
+
+def test_html_event_table_is_capped_at_five_picks():
+    out = render_html(_with_many_tickers(8))
+    for i in range(1, 6):
+        assert f"6000{i:02d}" in out
+    for i in range(6, 9):
+        assert f"6000{i:02d}" not in out
+
+
+def test_json_event_tickers_is_capped_at_five_picks():
+    payload = json.loads(render_json(_with_many_tickers(8)))
+    tickers = payload["events"][0]["tickers"]
+    assert [t["ticker_code"] for t in tickers] == [f"6000{i:02d}" for i in range(1, 6)]

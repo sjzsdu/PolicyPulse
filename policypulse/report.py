@@ -18,6 +18,7 @@ from policypulse.config import (
     INVESTABLE_CAVEAT,
     MAPPING_CAVEAT,
     REPO_ROOT,
+    Settings,
 )
 from policypulse.deepdive import substantive_verdict
 from policypulse.pipeline import RunResult
@@ -128,8 +129,10 @@ def _qualifying(ev, min_strength: int) -> list[dict]:
 
 
 def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: int,
-                  section: str, index: int) -> None:
-    rows = merge_tickers(qualifying)
+                  section: str, index: int, max_picks: int) -> None:
+    # 事件内个股先按 score 降序去重、再截断到 max_picks：与逻辑层同一口径，
+    # 渲染层不会因为「筛过一遍结论」而把上限放大回去
+    rows = merge_tickers(qualifying, max_picks)
     doc_count = len(ev.doc_ids)
     lines.append(f"### {index}. {ev.title}")
     lines.append("")
@@ -202,6 +205,7 @@ def _source_links(c: dict) -> str:
 def render_markdown(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
+    max_picks = int(s.get("max_picks", Settings.max_picks))
     events = _ensure_events(result)
     lines: list[str] = []
     lines.append(f"# PolicyPulse 日报 {result.window_end}")
@@ -299,6 +303,9 @@ def render_markdown(result: RunResult) -> str:
 
     lines.append("## 受益个股")
     lines.append("")
+    lines.append(f"> 选股上限：每个政策事件按 score（越高 = 相对上涨概率越大）降序，"
+                 f"只列前 {max_picks} 只；候选不足 {max_picks} 只时按实际数量列出，不补位。")
+    lines.append("")
     if filtered_out:
         lines.append(f"另有 {filtered_out} 条利好结论力度 < {min_strength}，未列入本表，详见同名 JSON 与数据库。")
         lines.append("")
@@ -311,21 +318,21 @@ def render_markdown(result: RunResult) -> str:
         lines.append("")
     for i, ev in enumerate(main_events, start=1):
         _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                      sections[ev.event_id], i)
+                      sections[ev.event_id], i, max_picks)
 
     if concept_events:
         lines.append("## 仅概念关联（深读判定无实质传导，不授予受益头衔）")
         lines.append("")
         for i, ev in enumerate(concept_events, start=1):
             _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                          sections[ev.event_id], i)
+                          sections[ev.event_id], i, max_picks)
 
     if pending_events:
         lines.append("## 待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）")
         lines.append("")
         for i, ev in enumerate(pending_events, start=1):
             _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                          sections[ev.event_id], i)
+                          sections[ev.event_id], i, max_picks)
 
     lines.extend(_non_investable_lines(result.conclusions))
 
@@ -435,11 +442,12 @@ def render_json(result: RunResult) -> str:
 
 
 def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
-                totals_by_event: dict[str, int] | None, min_strength: int) -> str:
+                totals_by_event: dict[str, int] | None, min_strength: int,
+                max_picks: int) -> str:
     """单个事件的 HTML 段：与 md 的 _render_event 同一套分区与筛选口径。"""
     section = _event_section(ev, verdicts_by_event, totals_by_event)
     qualifying = _qualifying(ev, min_strength)
-    table_rows = merge_tickers(qualifying)
+    table_rows = merge_tickers(qualifying, max_picks)
     trows = "".join(
         f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
         f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
@@ -486,7 +494,7 @@ def _non_investable_html(conclusions: list[dict]) -> str:
     )
 
 
-def _sections_html(result, events, min_strength: int) -> str:
+def _sections_html(result, events, min_strength: int, max_picks: int) -> str:
     """HTML 的分区，与 md / json 使用同一套 _event_section 判定。"""
     deepdives = list(getattr(result, "deepdives", None) or [])
     verdicts = _verdicts_by_event(deepdives)
@@ -499,18 +507,23 @@ def _sections_html(result, events, min_strength: int) -> str:
     pending_events = [ev for ev in events
                       if sections[ev.event_id] == SECTION_CONCEPT_PENDING and _qualifying(ev, min_strength)]
 
-    parts = ["<h2>受益个股</h2>"]
+    parts = ["<h2>受益个股</h2>",
+             f"<p class='meta'>选股上限：每个政策事件按 score（越高 = 相对上涨概率越大）"
+             f"降序只列前 {max_picks} 只；不足按实际数量列出，不补位。</p>"]
     if main_events:
-        parts.extend(_event_html(ev, verdicts, totals, min_strength) for ev in main_events)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength, max_picks)
+                     for ev in main_events)
     else:
         parts.append("<p><strong>今日无实质投资信号</strong>：没有深读明判「有实质影响」"
                      "的政策事件。下面是仅概念关联、待判定与非投资信号留痕。</p>")
     if concept_events:
         parts.append("<h2>仅概念关联（深读判定无实质传导，不授予受益头衔）</h2>")
-        parts.extend(_event_html(ev, verdicts, totals, min_strength) for ev in concept_events)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength, max_picks)
+                     for ev in concept_events)
     if pending_events:
         parts.append("<h2>待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）</h2>")
-        parts.extend(_event_html(ev, verdicts, totals, min_strength) for ev in pending_events)
+        parts.extend(_event_html(ev, verdicts, totals, min_strength, max_picks)
+                     for ev in pending_events)
     parts.append(_non_investable_html(result.conclusions))
     return "".join(parts)
 
@@ -518,6 +531,7 @@ def _sections_html(result, events, min_strength: int) -> str:
 def render_html(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
+    max_picks = int(s.get("max_picks", Settings.max_picks))
     events = _ensure_events(result)
     non_investable = [c for c in result.conclusions if not c.get("investable", True)]
 
@@ -540,7 +554,7 @@ def render_html(result: RunResult) -> str:
             body = (f"<p><strong>{_esc(EMPTY_DAY_NOTICE)}</strong>（窗口 "
                     f"{_esc(result.window_start)} ~ {_esc(result.window_end)}）</p>")
     else:
-        body = _sections_html(result, events, min_strength)
+        body = _sections_html(result, events, min_strength, max_picks)
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PolicyPulse 日报 {_esc(result.window_end)}</title>

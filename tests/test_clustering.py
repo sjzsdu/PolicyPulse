@@ -99,3 +99,35 @@ def test_events_sort_by_date_then_best_score():
                tickers=[_t("600002", 80.0)])
     events = cluster_events([newer, older])
     assert [e.published_at for e in events] == ["2026-10-19", "2026-10-10"]
+
+
+def _many(code_prefix: str = "6000", n: int = 8):
+    """n 只分数递增的个股，用于验证「先排序、再截断」。"""
+    return [_t(f"{code_prefix}{i:02d}", float(i * 10)) for i in range(1, n + 1)]
+
+
+def test_event_tickers_capped_after_score_sort():
+    """事件级选股上限：去重后按 score 降序，只留前 max_picks 只（WAN-21）。"""
+    events = cluster_events([_c("doc-1#1", tickers=_many())], max_picks=5)
+    codes = [t["ticker_code"] for t in events[0].tickers]
+    assert codes == ["600008", "600007", "600006", "600005", "600004"]
+    assert [t["score"] for t in events[0].tickers] == [80.0, 70.0, 60.0, 50.0, 40.0]
+
+
+def test_event_tickers_not_padded_when_fewer_than_cap():
+    events = cluster_events(
+        [_c("doc-1#1", tickers=[_t("600001", 70.0), _t("600002", 90.0)])], max_picks=5)
+    assert [t["ticker_code"] for t in events[0].tickers] == ["600002", "600001"]
+
+
+def test_event_tickers_without_limit_keep_all_rows():
+    """不传上限时保持旧行为（供历史重算/单测使用）；线上链路一定传 settings.max_picks。"""
+    events = cluster_events([_c("doc-1#1", tickers=_many())])
+    assert len(events[0].tickers) == 8
+
+
+def test_merge_tickers_limit_truncates_after_sort():
+    rows = merge_tickers([
+        _c("s1", tickers=[_t("600001", 10.0), _t("600002", 90.0), _t("600003", 50.0)]),
+    ], 2)
+    assert [r["ticker_code"] for r in rows] == ["600002", "600003"]
