@@ -79,3 +79,23 @@ def test_simplify_hant_fixes_zhongdong_typo():
     assert simplify_hant("") == ""
     # 其余繁体滑字同样归一（未收录的字原样保留）
     assert simplify_hant("華經貿聯席會議") == "华经贸联席会议"
+
+
+def test_publish_time_prefers_pubdate_meta_over_first_date_in_page():
+    """详情页优先用 meta PubDate：整页第一个日期可能是栏目标板里的其它日期。
+
+    商务部稿件用的是 `<meta name="PubDate" content="2026-10-24 19:42">`，
+    页头还有 MakeTime（生成时间），撞第一个日期会拿到不该用的那一天。
+    """
+    html = (
+        '<html><head><meta name="MakeTime" content="2026-10-27 12:35:44">'
+        '<meta name="PubDate" content="2026-10-24 19:42"></head>'
+        "<body><div>商务部新闻发言人就对外投资限制答记者问 2026-10-20</div></body></html>"
+    )
+    assert extract_publish_time(html) == "2026-10-24"
+
+
+def test_publish_time_meta_without_date_falls_back_to_regex():
+    html = ('<html><head><meta name="PubDate" content=""></head>'
+            "<body><div>发布时间：2026-10-09</div></body></html>")
+    assert extract_publish_time(html) == "2026-10-09"

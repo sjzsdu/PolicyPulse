@@ -215,9 +215,18 @@ def fetch_documents(fetcher: Fetcher, specs, settings: Settings, window_start: s
         # 正文最短长度：公开市场操作公告一类短稿可以逐源放宽
         min_body = int(spec.extra.get("min_body_length", 200))
 
+        # 候选排序（本 issue 的根因之一）：列表页的页面顺序是「栏目顺序」，
+        # 不是时间顺序——商务部 xwfb 首页先排领导人活动、再排部领导活动，产业类栏目
+        # （日常新闻发布/发言人谈话/司局负责人发布）排在后面。按页面顺序截断到
+        # max_docs_per_source，最新产业稿件永远进不了候选池。所以这里先按发布日期
+        # 倒序（新稿优先），无日期的条目保留页面顺序排在最后，仍需详情页判定。
+        dated = sorted((i for i in items if i.published_at),
+                       key=lambda i: i.published_at, reverse=True)
+        ordered = dated + [i for i in items if not i.published_at]
+
         picked = []
         cached_skips = 0
-        for item in items:
+        for item in ordered:
             fetcher.configure_rate_limit(item.url, spec.rate_limit_seconds)
             if item.published_at and not _in_window(item.published_at, window_start, window_end):
                 continue
