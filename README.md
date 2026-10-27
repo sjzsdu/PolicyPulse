@@ -36,17 +36,21 @@ policypulse run               # 抓取 → 抽取 → 映射 → 打分 → 出�
 `policypulse run --since N`（窗口 `[目标日-N, 目标日]`），它的产物同样是按日期落盘的
 独立日报，不会混进当天那份。概览里写明本次真实统计窗口。
 
-跑完的产物：
+跑完的产物（`reports/` 全部是本机交付物，不入库）：
 
-- `reports/YYYY-MM-DD.md` — 日报（主交付，快照路径写成**相对仓库根**，入库）
-- `reports/YYYY-MM-DD.html` — 单页只读展示（入库）
-- `reports/YYYY-MM-DD.json` — 同一批结论的结构化版本（**不入库**，含本机绝对路径
-  与逐源合规台账 `stats.sources_detail`）
+- `reports/YYYY-MM-DD.md` — 日报（主交付，给读者看：本期概览 → 受益个股 → 主题关联 →
+  待确认 → 其他政策信号 → 泛政策表述 → 个股深度研判 → 信息来源）
+- `reports/YYYY-MM-DD.html` — 同一份内容的单页展示，浏览器直接打开
+- `reports/YYYY-MM-DD.json` — 同一批结论的结构化版本（**复核用**：run_id、抓取告警、
+  快照绝对路径、逐源合规台账 `stats.sources_detail`、分区键与逐条判定依据）
 - `data/policypulse.db` — SQLite：documents / signals / signal_ticker / runs …
 - `data/snapshots/<run_id>/*` — 原文快照（不入库，后缀跟随原件）
 - `inbound/<source_id>/` — 人工下载的原文（目录骨架入库，用户放进去的文件不入库）
 
-`reports/2026-10-20.md` 是本机真实跑出来的一份，可以直接打开看效果。
+**md / html 只写给读者看**：运行期指标（run_id、抓取告警、窗口内外计数、闸门统计、
+LLM 开没开、tongstock 调用次数）、内部 ID（事件/信号/快照路径）、robots 合规台账、
+复核命令一律不进这两个文件——它们在 JSON 与数据库里，复核照旧拿得到。
+`tests/test_report.py::test_product_carries_no_developer_facing_content` 钉住了这条边界。
 
 其它命令：
 
@@ -231,8 +235,17 @@ sources.yaml 入口页
 `[目标日-N, 目标日]`。窗口由 `published_at` 决定，概览第一行写明实际窗口。窗口外的稿子
 既不抓也不入库进当天结论——这是「今日日报只收当日增量」的实现边界。
 
-Markdown 正文只收「利好 + 有板块映射 + `strength >= min_strength_for_report`」（默认 3）；
-被力度门槛滤掉的条数写在概览里，完整结论在同日 JSON 与数据库中，不静默丢。
+日报正文分四类呈现，读者按「能不能落到具体公司」逐级往下看：
+
+- **受益个股**：政策明确指向具体行业，且深读判定「有实质影响」的事件；
+- **主题关联**：政策与行业有关，但没有足够证据判断会实质影响公司业绩，只作主题参考；
+- **待确认**：本期还没做出实质影响判断的事件，先列出可关联的主题与个股；
+- **其他政策信号 / 泛政策表述**：方向中性或偏空、力度不足、没落到具体板块，以及整体性
+  的方向性表述——留痕，不展开个股。
+
+事件正文只收「利好 + 有板块映射 + `strength >= min_strength_for_report`」（默认 3）；
+力度不够的信号落到「其他政策信号」里照样可见，完整结论与过滤原因在同日 JSON 与数据库，
+不静默丢。
 
 ### 打分（score-v2）
 

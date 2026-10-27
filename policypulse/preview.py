@@ -25,6 +25,7 @@ from datetime import date
 from pathlib import Path
 
 from policypulse.config import DISCLAIMER, Settings, default_paths
+from policypulse.report import SECTION_LABELS
 from policypulse.store import Store
 from policypulse.tongstock import TongstockClient, TongstockError
 
@@ -507,20 +508,22 @@ _SECTION_CLASS = {
 def _tags(row: dict) -> str:
     sections = row.get("sections") or []
     if not sections:
-        return "<span class='tag t-other'>未分区</span>"
-    return "".join(f"<span class='tag {_SECTION_CLASS.get(s, 't-other')}'>{_esc(s)}</span>"
-                   for s in sections)
+        return "<span class='tag t-other'>未标注</span>"
+    return "".join(
+        f"<span class='tag {_SECTION_CLASS.get(s, 't-other')}'>"
+        f"{_esc(SECTION_LABELS.get(s, s))}</span>"
+        for s in sections)
 
 
 def render_preview(day: str, rows: list[dict], missing: list[dict], agg: dict,
-                   origin: str, generated_at: str) -> str:
+                   generated_at: str) -> str:
     """单页验证报告：KPI + 组合曲线 + 排行表 + 口径说明（服务端渲染，无脚本）。"""
     latest = max((r["last_date"] for r in rows), default=day)
     bench = agg.get("bench_pct")
     excess = agg.get("excess")
 
     kpis = [
-        (f"{agg['priced']} / {agg['total']}", "股票（有行情 / 全部）"),
+        (f"{agg['priced']} / {agg['total']}", "个股（有行情 / 全部）"),
         (f"{agg['up']} 涨 · {agg['down']} 跌", f"胜率 {agg['win_rate'] if agg['win_rate'] is not None else '—'}%"),
         (_pct(agg["avg"]), "平均涨跌（等权）"),
         (_pct(agg["median"]), "中位数"),
@@ -542,12 +545,13 @@ def render_preview(day: str, rows: list[dict], missing: list[dict], agg: dict,
     chart = portfolio_chart(p_dates, p_vals)
 
     section_pills = "".join(
-        f"<span class='tag {_SECTION_CLASS.get(s, 't-other')}'>{_esc(s)} · {n} 只</span>"
+        f"<span class='tag {_SECTION_CLASS.get(s, 't-other')}'>"
+        f"{_esc(SECTION_LABELS.get(s, s))} · {n} 只</span>"
         for s, n in (agg.get("sections") or {}).items())
 
     body_rows = []
     for i, r in enumerate(rows, start=1):
-        stale = "<span class='badge'>仅基准日一根K线</span>" if r.get("stale") else ""
+        stale = "<span class='badge'>仅一根日线</span>" if r.get("stale") else ""
         live_mark = "<span class='badge'>盘中</span>" if r.get("live") else ""
         body_rows.append(
             f"<tr><td>{i}</td>"
@@ -569,55 +573,51 @@ def render_preview(day: str, rows: list[dict], missing: list[dict], agg: dict,
             f"<tr><td><code>{_esc(m['ticker_code'])}</code></td>"
             f"<td>{_esc(m.get('ticker_name') or '')}</td>"
             f"<td class='small'>{_esc(' · '.join(m.get('events') or [])) or '—'}<br>"
-            "日线取数失败或无数据（未计入统计）</td></tr>"
+            "未取到行情数据，未计入统计</td></tr>"
             for m in missing)
         missing_rows = (
-            "<h2>无行情数据（不计入统计）</h2><div class='tablewrap'><table>"
+            "<h2>暂无行情数据（未计入统计）</h2><div class='tablewrap'><table>"
             "<thead><tr><th>代码</th><th>名称</th><th>说明</th></tr></thead>"
             f"<tbody>{cells}</tbody></table></div>")
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PolicyPulse 验证 · {_esc(day)}</title>
+<title>PolicyPulse 复盘 · {_esc(day)} 个股走势</title>
 <style>{_PV_CSS}</style></head><body><div class="paper">
 <header class="hero">
-<h1>验证 · <span style="color:#ffd97a">{_esc(day)}</span> 日报个股走势</h1>
-<p class="sub">信号日 {_esc(day)} → 最新交易日 {_esc(latest)} · 取数来源：{_esc(origin)}
- · 生成于 {_esc(generated_at)} · 数据仅供研究参考</p>
+<h1><span style="color:#ffd97a">{_esc(day)}</span> 日报个股走势复盘</h1>
+<p class="sub">信号日 {_esc(day)} → 最新交易日 {_esc(latest)} · 生成于 {_esc(generated_at)}
+ · 数据仅供研究参考，不构成投资建议</p>
 <div class="kpis">{kpi_html}</div>
 </header>
 <main class="card">
-<h2>等权组合走势（各自基准 = 100）</h2>
-<p class="meta">每只股票以「不晚于信号日的最后一根日线收盘价」为 100，逐日等权平均。
-{f'基准同期：{_esc(BENCHMARK_NAME)} <b class="{_cls(bench)}">{_pct(bench)}</b>。' if bench is not None else ''}
+<h2>等权组合走势（起点 = 100）</h2>
+<p class="meta">每只股票以「信号日之前最后一个收盘价」为 100，逐日等权平均。
+{f'同期基准：{_esc(BENCHMARK_NAME)} <b class="{_cls(bench)}">{_pct(bench)}</b>。' if bench is not None else ''}
 {f'平均超额：<b class="{_cls(excess)}">{_pct(excess)}</b>。' if excess is not None else ''}</p>
 {chart}
-{f'<div class="pills">分区分布：{section_pills}</div>' if section_pills else ''}
+{f'<div class="pills">本期个股分布：{section_pills}</div>' if section_pills else ''}
 </main>
 <main class="card">
 <h2>个股区间表现（按涨跌幅排序）</h2>
 <div class="tablewrap"><table>
-<thead><tr><th>#</th><th>代码</th><th>名称</th><th>分区</th><th>事件 · 板块</th>
-<th>基准日/价</th><th>最新日/价</th><th>区间涨跌</th><th>区间最高</th><th>区间最低</th>
+<thead><tr><th>#</th><th>代码</th><th>名称</th><th>类型</th><th>政策事件 · 板块</th>
+<th>起点日/价</th><th>最新日/价</th><th>区间涨跌</th><th>区间最高</th><th>区间最低</th>
 <th>走势</th></tr></thead>
 <tbody>{''.join(body_rows)}</tbody></table></div>
 {missing_rows}
 </main>
 <main class="card">
-<h2>口径说明</h2>
-<p class="caveat">基准价 = 不晚于信号日的最后一根日线收盘价（政策多在盘后发布，拿发布前
-最后收盘当基准，区间涨跌才是「消息出来之后市场给了多少」）；信号日为非交易日时自动顺延到
-之前最近的交易日。若返回数据里基准日之前还有更早的行，以区间内第一根为准。</p>
-<p class="caveat">区间涨跌 = 最新交易日收盘 / 基准价 − 1；未做分红、拆分的复权调整
-（价格口径以 tongstock 日线原样为准）。汇总为等权平均，每只股票权重相同。
-当日日线未落库时（盘中或次日凌晨），用 <code>quote</code> 当日最新价补上「今天」
-这个点，表内标「盘中」；当日日线只是昨收占位（部分品种会先放一根占位桩）时，
-同样用盘中价刷新那一根的收盘——但作为基准的那根永不用盘中价刷新（基准必须是
-信号发布前的价格）。若盘中价与日线价格口径对不上（部分品种 quote 返回
-10 倍价），则放弃该点只用日线——宁缺毋错。</p>
-<p class="caveat">基准对照为 {_esc(BENCHMARK_NAME)}（{BENCHMARK_CODE}）同期区间涨跌；
-本机 tongstock 取不到指数日线，故用同市场口径的 ETF 替代，取不到时留空。</p>
-<p class="caveat">涨跌配色按 A 股惯例：红涨绿跌。本页为研究参考，不构成投资建议。</p>
+<h2>读这一页需要知道的</h2>
+<p class="caveat">涨跌从哪天算起：起点是「信号日之前最后一个交易日的收盘价」。政策多在盘后
+发布，用发布前的价格当起点，区间涨跌才是「消息出来之后，市场给了多少」；信号日若休市，
+自动顺延到之前最近的交易日。</p>
+<p class="caveat">区间涨跌 = 最新收盘价 ÷ 起点价 − 1。未做分红、拆股的复权调整，按行情原始
+价格计算；汇总取等权平均，每只股票权重相同。当日行情尚未收盘时，用最新价补上「今天」这个
+点并标注「盘中」；起点那一根只用收盘价，不参与盘中刷新。</p>
+<p class="caveat">基准对照为 {_esc(BENCHMARK_NAME)}（{BENCHMARK_CODE}）同期涨跌，用来回答
+「同样的时间，市场整体涨了多少」。取不到基准行情时这一项留空。</p>
+<p class="caveat">涨跌配色按 A 股惯例：红涨绿跌。本页仅供研究参考，不构成投资建议。</p>
 </main>
 <footer><p class="disc">{_esc(DISCLAIMER)}</p></footer>
 </div></body></html>"""
@@ -634,7 +634,7 @@ def build_preview(day: str, paths, settings: Settings, client=None,
     """
     today = date.today().isoformat()
     rpath = report_json or (paths.reports / f"{day}.json")
-    selection, origin = load_selection(rpath, paths, day)
+    selection, _origin = load_selection(rpath, paths, day)
     if not selection:
         return None
 
@@ -686,7 +686,7 @@ def build_preview(day: str, paths, settings: Settings, client=None,
 
     generated = time.strftime("%Y-%m-%d %H:%M:%S")
     log("汇总：" + preview_summary(agg))
-    page = render_preview(day, rows, missing, agg, origin, generated)
+    page = render_preview(day, rows, missing, agg, generated)
     out_path = out or (paths.reports / f"{day}-preview.html")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(page, encoding="utf-8")
