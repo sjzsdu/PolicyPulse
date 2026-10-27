@@ -29,7 +29,7 @@ def _result() -> RunResult:
         "tickers": [{
             "ticker_code": "600001", "ticker_name": "测试A", "exchange": "sh", "board": "沪市主板",
             "market_cap": 500.0, "sector_name": "低空经济", "sector_source": "通达信概念",
-            "why": "主题「低空经济」直接命中", "score": 82.0, "rank": 1,
+            "why": "政策主题「低空经济」直接对应板块「低空经济」", "score": 82.0, "rank": 1,
             "mapping_path": "低空经济 → 低空经济(通达信概念) → 600001", "mapping_confidence": 1.0,
         }],
     }]
@@ -41,17 +41,40 @@ def test_markdown_carries_disclaimer_and_source():
     assert "不构成任何投资建议" in md
     assert "https://www.gov.cn/a.htm" in md
     assert "600001" in md
-    assert "抓取告警" in md
 
 
-def test_markdown_lists_signal_traceability_fields():
+def test_product_carries_no_developer_facing_content():
+    """WAN-22：md / html 是给读者看的，管道指标与规则话术一律不进这两个出口。
+
+    这些词一旦回流，说明又有人把调试信息写进了产物——所以按清单钉死。
+    """
+    dev_words = [
+        "run_id", "事件ID", "信号ID", "快照", "robots", "映射路径", "闸门", "分区",
+        "strength", "confidence", "global_max_picks", "policypulse verify",
+        "policypulse show", "data/policypulse.db", "抓取告警", "窗口外剔除",
+        "LLM 抽取", "语义判定", "深读", "doc-", "evt-",
+    ]
+    r = _result()
+    md, html = render_markdown(r), render_html(r)
+    for word in dev_words:
+        assert word not in md, f"md 里不该出现开发者侧内容：{word}"
+        assert word not in html, f"html 里不该出现开发者侧内容：{word}"
+
+
+def test_reader_facing_traceability_survives():
+    """去规则话术不等于丢溯源：原文链接、力度刻度、受益理由都要还在。"""
     md = render_markdown(_result())
-    for field in ("信号ID", "引用校验", "快照", "映射路径"):
-        assert field in md
+    assert "查看政策原文" in md
+    assert "https://www.gov.cn/a.htm" in md
+    assert "影响力度 4/5（较强）" in md
+    assert "政策主题「低空经济」直接对应板块「低空经济」" in md
+    html = render_html(_result())
+    assert "查看政策原文" in html
+    assert "https://www.gov.cn/a.htm" in html
 
 
-def test_markdown_keeps_all_out_of_window_warning_details():
-    """窗口外剔除改为逐条告警后，明细不能被旧的 15 条展示上限截断。"""
+def test_warnings_stay_in_json_when_they_leave_the_product():
+    """抓取告警不再印进日报，但不能被静默丢掉：JSON 里逐条都在。"""
     r = _result()
     r.warnings = [
         f"mofcom_xw: 窗口外剔除 https://example.com/{i}.htm"
@@ -59,10 +82,10 @@ def test_markdown_keeps_all_out_of_window_warning_details():
         for i in range(20)
     ]
     md = render_markdown(r)
-    shown = [line for line in md.splitlines()
-             if line.startswith("- ") and "窗口外剔除" in line]
-    assert len(shown) == 20, "20 条剔除明细必须全部可见"
-    assert "https://example.com/19.htm" in md, "最后一条也不能被截断"
+    assert "窗口外剔除" not in md
+    payload = json.loads(render_json(r))
+    assert len(payload["warnings"]) == 20 and "https://example.com/19.htm" in \
+        payload["warnings"][-1]
 
 
 def test_markdown_deepdive_sources_line_renders():
@@ -103,28 +126,32 @@ def test_html_escapes_and_links_source():
     assert "https://www.gov.cn/a.htm" in out
 
 
-def test_html_strength_filter_and_caveat():
-    """HTML 与 Markdown 口径一致：力度不足的不进正文，口径说明必须在顶部。"""
+def test_html_strength_filter_matches_markdown():
+    """HTML 与 Markdown 口径一致：力度不足的不进事件正文（落入「其他政策信号」）。"""
     r = _result()
-    r.conclusions.append({**r.conclusions[0], "signal_id": "doc-1#2", "strength": 1})
+    r.conclusions.append({**r.conclusions[0], "signal_id": "doc-1#2", "strength": 1,
+                          "summary": "力度不足的弱信号"})
     out = render_html(r)
-    assert MAPPING_CAVEAT in out
-    assert out.count("<h3>") == 1, "strength=1 的那条不应出现在 HTML 正文"
-
-
-def test_markdown_strength_filter_reports_count():
-    r = _result()
-    r.conclusions.append({**r.conclusions[0], "signal_id": "doc-1#2", "strength": 1})
     md = render_markdown(r)
-    assert "另有 1 条利好结论力度 < 3" in md
-    assert MAPPING_CAVEAT in md
+    assert out.count("<article class='event'>") == 1, "strength=1 的那条不应进事件正文"
+    assert "力度不足的弱信号" in out and "力度不足的弱信号" in md
+    assert out.index("力度不足的弱信号") > out.index("其他政策信号")
+    assert md.index("力度不足的弱信号") > md.index("## 其他政策信号")
 
 
-def test_markdown_snapshot_path_is_relative(tmp_path):
-    """Markdown 里不能出现本机绝对路径；JSON 里保留绝对路径。"""
+def test_mapping_caveat_lives_in_json_not_in_the_product():
+    """第三方板块口径说明留在 JSON（供复核），日报正文只给读者看得懂的口径。"""
+    md, payload = render_markdown(_result()), json.loads(render_json(_result()))
+    assert MAPPING_CAVEAT not in md
+    assert payload["mapping_caveat"] == MAPPING_CAVEAT
+    assert "综合评分" in md and "主题相关度" in md
+
+
+def test_markdown_has_no_local_paths():
+    """正文里不能出现本机绝对路径，也不能出现快照路径（那是复核用的）；JSON 保留。"""
     md = render_markdown(_result())
     assert "/Users/" not in md
-    assert "data/snapshots/" in md
+    assert "data/snapshots/" not in md
     payload = json.loads(render_json(_result()))
     assert Path(payload["conclusions"][0]["raw_snapshot_path"]).is_absolute()
 
@@ -139,30 +166,35 @@ def test_empty_day_reports_nothing_and_keeps_no_fallback_language():
         "sources_total": 6, "sources_failed": 0, "sources_ok": 6,
         "sources_no_update": ["gov_cn"], "tongstock_calls": 0, "llm_enabled": False,
         "duplicates_skipped": 0, "min_strength_for_report": 3, "gate": {},
+        "sources_detail": [
+            {"id": "gov_cn", "org": "中国政府网", "enabled": True, "robots": "allowed",
+             "robots_reason": "robots.txt 已获取", "docs": 0},
+            {"id": "gov_zhengce", "org": "国务院", "enabled": True, "robots": "allowed",
+             "robots_reason": "robots.txt 已获取", "docs": 0},
+        ],
     }
     empty.failed_sources = []
     empty.warnings = []
     md = render_markdown(empty)
     assert EMPTY_DAY_NOTICE in md
     assert "窗口外兜底" not in md
-    assert "gov_cn" in md, "哪些源没更新要如实写出来"
+    # 哪些渠道本期没有更新，要如实写出来（读者视角：机构名 + 无更新）
+    assert "中国政府网" in md and "无更新" in md
+    assert "gov_cn" not in md, "内部源 ID 不进产物"
 
     # 有产出的报告里同样不能残留兜底措辞
     assert "窗口外兜底" not in render_markdown(_result())
 
 
-def test_markdown_states_the_company_gate():
-    md = render_markdown(_result())
-    assert "公司级相关性闸门" in md
-
-
-def test_markdown_labels_unparsed_profile_gate_rows():
-    """闸门统计里「F10 已取未解析」必须与「无画像」分两行标签显示。"""
+def test_gate_statistics_stay_out_of_the_product():
+    """闸门统计是管道指标：产物不该出现，但必须完整留在 JSON stats 里可审计。"""
     r = _result()
     r.stats["gate"] = {"no_profile": 1, "unparsed_profile": 2}
     md = render_markdown(r)
-    assert "无画像放行 1" in md
-    assert "F10已取未解析放行 2" in md
+    assert "无画像放行" not in md and "F10已取未解析放行" not in md
+    assert "公司级相关性闸门" not in md
+    payload = json.loads(render_json(r))
+    assert payload["stats"]["gate"] == {"no_profile": 1, "unparsed_profile": 2}
 
 
 def _with_compliance(result: RunResult) -> RunResult:
@@ -186,26 +218,32 @@ def _with_compliance(result: RunResult) -> RunResult:
     return result
 
 
-def test_report_shows_pbc_coverage_and_its_source():
+def test_product_lists_where_the_news_came_from():
+    """读者要知道消息从哪来：机构名 + 本期收录篇数；停用的源不出现。"""
     md = render_markdown(_with_compliance(_result()))
-    assert "央行（中国人民银行）相关文档" in md
-    assert "xinhua_pbc" in md
-
-
-def test_report_carries_the_per_source_compliance_ledger():
-    """合规要看得见：每个源的 robots 判定、停用源不得有任何抓取。"""
-    md = render_markdown(_with_compliance(_result()))
-    assert "信息源与合规" in md
-    assert "pbc_xw" in md and "未启用" in md
-    assert "不发起任何请求" in md
-    assert "本地入库" in md
+    assert "## 信息来源" in md
+    assert "中国人民银行（新华网转载）" in md and "2 篇" in md
+    assert "中国人民银行 | 无更新" in md
+    assert "pbc_xw" not in md and "未启用" not in md, "停用源不进产物"
 
     out = render_html(_with_compliance(_result()))
-    assert "信息源与合规" in out
-    assert "不发起网络请求" in out
+    assert "<h2>信息来源</h2>" in out
+    assert "中国人民银行（新华网转载）" in out
+    assert "pbc_xw" not in out
 
+
+def test_compliance_ledger_stays_auditable_in_json():
+    """robots 判定/停用源这些合规台账搬进 JSON：产物里不看，但审计拿得到。"""
     payload = json.loads(render_json(_with_compliance(_result())))
-    assert payload["stats"]["sources_detail"][0]["robots"] == "allowed"
+    detail = payload["stats"]["sources_detail"]
+    assert detail[0]["robots"] == "allowed"
+    by_id = {r["id"]: r for r in detail}
+    assert by_id["pbc_xw"]["enabled"] is False
+    assert "不发起任何请求" in by_id["pbc_xw"]["robots_reason"]
+    assert by_id["pbc_inbound"]["robots"] == "本地入库"
+    # 央行覆盖统计同样留在 stats（产物不展示管道指标）
+    assert payload["stats"]["pbc_related_docs"] == 2
+    assert "央行（中国人民银行）相关文档" not in render_markdown(_with_compliance(_result()))
 
 
 def _with_many_tickers(n: int = 8) -> RunResult:
@@ -226,7 +264,7 @@ def test_markdown_event_table_is_capped_at_five_picks():
         assert f"6000{i:02d}" in md, f"前 5 只里的 6000{i:02d} 必须出现"
     for i in range(6, 9):
         assert f"6000{i:02d}" not in md, f"6000{i:02d} 分数更低，不该出现在日报里"
-    assert "选股上限" in md
+    assert "整份日报最多列出 5 只个股" in md
 
 
 def test_html_event_table_is_capped_at_five_picks():
@@ -280,7 +318,7 @@ def test_multi_event_report_total_is_capped_at_five():
     for code in ("600006", "600003", "600005", "600002", "600004"):
         assert code in md, f"全局前 5 名里的 {code} 必须出现"
     assert "600001" not in md, "分数最低的 600001 不该挤进全局 Top-5"
-    assert "| 全局入选个股（上限 5） | 5 |" in md, "概览要给可核对的全局入选数"
+    assert "- **列出个股**：5 只" in md, "概览要给可核对的入选数"
 
     out = render_html(r)
     assert len(_shown(out)) == 5 and "600001" not in out
@@ -295,7 +333,7 @@ def test_multi_event_report_falls_back_when_global_cap_disabled():
     r = _multi_event_result(global_cap=0)
     md = render_markdown(r)
     assert len(_shown(md)) == 6, f"关闭后应按每事件口径列出：{_shown(md)}"
-    assert "全局截断已关闭" in md
+    assert "每个政策事件按综合评分从高到低最多列 5 只" in md
 
 
 def test_pipeline_style_result_stays_capped_globally():
@@ -335,9 +373,9 @@ def test_event_with_all_picks_cut_shows_notice_instead_of_empty_table():
     r.events = events
 
     md = render_markdown(r)
-    assert "未进入全局选股 Top-5" in md
+    assert "未进入本期名单" in md
     assert "600010" not in md and "600011" not in md
-    assert "未进入全局选股 Top-5" in render_html(r)
+    assert "未进入本期名单" in render_html(r)
 
 
 def _same_code_result() -> RunResult:
@@ -392,11 +430,11 @@ def test_same_code_in_two_events_is_listed_once():
 
     winner_row = next(line for line in md.splitlines() if "| 600003 |" in line)
     assert "| 90.0 |" in winner_row, "留下的是会议A 的 90 分那行，不是 B 的 60 分"
-    assert "| 全局入选个股（上限 5） | 5 |" in md, "概览数字必须与正文行数自洽"
+    assert "- **列出个股**：5 只" in md, "概览数字必须与正文行数自洽"
 
     out = render_html(r)
-    assert out.count("<td>600003</td>") == 1
-    assert out.count("<tr><td>") == 5, "html 表格行数必须等于全局入选数"
+    assert out.count("<td class='code'>600003</td>") == 1
+    assert out.count("<td class='code'>") == 5, "html 表格行数必须等于全局入选数"
 
     payload = json.loads(render_json(r))
     shown = [t["ticker_code"] for e in payload["events"] for t in e["tickers"]]

@@ -93,12 +93,18 @@ def rank(signal: Signal, candidates: list[Candidate], settings: Settings) -> lis
 
 
 def why_of(signal: Signal, cand: Candidate) -> str:
-    """一句话受益理由（≤40 字），把主题与板块的差别写出来。"""
+    """一句话受益理由（≤40 字）：说清「哪个政策主题、落在哪个板块」。
+
+    这一段会印在日报个股表里给读者看，所以只写人话：不出现匹配算法名
+    （contains/fuzzy）、数据源名（通达信）这类实现细节。
+    """
     theme = cand.mapping_path.split(" → ")[0]
     if theme == cand.sector_name:
-        base = f"主题「{theme}」直接命中{cand.sector_source}，力度{signal.strength}"
+        base = f"政策主题「{theme}」直接对应板块「{cand.sector_name}」"
+    elif cand.match_type == "fuzzy":
+        base = f"政策主题「{theme}」近似关联板块「{cand.sector_name}」"
     else:
-        base = f"主题「{theme}」映射到{cand.sector_name}（{cand.match_type}）"
+        base = f"政策主题「{theme}」关联板块「{cand.sector_name}」"
     if cand.gate_basis == "weak_hit":
-        return f"{base}；业务弱证据"
+        return f"{base}；公司业务关联偏弱"
     return base[:40]

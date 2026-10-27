@@ -45,6 +45,7 @@ from policypulse.report import (
     SECTION_BULLISH,
     SECTION_CONCEPT_ONLY,
     SECTION_CONCEPT_PENDING,
+    SECTION_LABELS,
     SECTION_NON_INVESTABLE,
     _event_section,
     render_html,
@@ -175,9 +176,10 @@ def test_non_investable_signal_never_enters_bullish_table(tmp_path):
     signal_id = conclusions[0]["signal_id"]
 
     md = render_markdown(result)
-    assert signal_id in md, "非投资信号必须留痕"
-    assert "## 非投资信号" in md
-    assert "## 受益个股" in md and "今日无实质投资信号" in md
+    non_inv = _md_block(md, "## " + SECTION_LABELS[SECTION_NON_INVESTABLE])
+    assert conclusions[0]["summary"][:40] in non_inv, "非投资信号必须留痕"
+    assert signal_id not in md, "内部信号 ID 不进产物（JSON 里有）"
+    assert "## 受益个股" in md and "本期暂无明确受益个股" in md
     assert "601888" not in md, "非投资信号不得展开任何个股"
     assert not re.search(r"^\| 1 \| 601888", md, re.M)
 
@@ -187,7 +189,9 @@ def test_non_investable_signal_never_enters_bullish_table(tmp_path):
     assert payload["conclusions"][0]["investable"] is False
 
     html = render_html(result)
-    assert "非投资信号" in html and signal_id in html
+    html_non_inv = _html_blocks(html)["noninv"]
+    assert conclusions[0]["summary"][:40] in html_non_inv
+    assert signal_id not in html
     assert "601888" not in html
 
 
@@ -412,17 +416,6 @@ def _mixed_result() -> RunResult:
     return r
 
 
-def _md_sections(md: str) -> dict[str, str]:
-    sections: dict[str, str] = {}
-    current = ""
-    for line in md.splitlines():
-        if line.startswith("- 事件ID：`"):
-            current = line.split("`")[1]
-        elif line.startswith("- 分区：") and current:
-            sections[current] = line[len("- 分区："):].strip()
-    return sections
-
-
 def _md_block(md: str, heading: str) -> str:
     """某个二级标题到下一个二级标题之间的正文。"""
     if heading not in md:
@@ -430,24 +423,57 @@ def _md_block(md: str, heading: str) -> str:
     return re.split(r"\n## ", md.split(heading, 1)[1], maxsplit=1)[0]
 
 
-def _html_sections(html: str) -> dict[str, str]:
-    return {k: v.strip() for k, v in
-            re.findall(r"事件ID <code>(evt-[\w]+)</code> · 分区：([^·<]+)", html)}
+def _md_blocks(md: str) -> dict[str, str]:
+    """md 的二级标题 → 该块正文。"""
+    blocks: dict[str, str] = {}
+    for part in re.split(r"\n## ", md)[1:]:
+        head, _, body = part.partition("\n")
+        blocks[head.strip()] = body
+    return blocks
+
+
+def _html_blocks(html: str) -> dict[str, str]:
+    """html 的内容区块：<section class='card' id='xxx'> … 到下一个区块。"""
+    blocks: dict[str, str] = {}
+    marks = list(re.finditer(r"<section class='card' id='([\w-]+)'>", html))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(html)
+        blocks[m.group(1)] = html[m.start():end]
+    return blocks
+
+
+# 分区 → (md 二级标题, html 区块 id)：产物的分区展示与内部键名的唯一映射表
+SECTION_BLOCKS = {
+    SECTION_BULLISH: (SECTION_LABELS[SECTION_BULLISH], "bullish"),
+    SECTION_CONCEPT_ONLY: (SECTION_LABELS[SECTION_CONCEPT_ONLY], "concept"),
+    SECTION_CONCEPT_PENDING: (SECTION_LABELS[SECTION_CONCEPT_PENDING], "pending"),
+}
 
 
 def test_three_end_sections_are_consistent():
     r = _mixed_result()
     md, payload, html = render_markdown(r), json.loads(render_json(r)), render_html(r)
+    md_blocks, html_blocks = _md_blocks(md), _html_blocks(html)
 
-    md_sections = _md_sections(md)
     json_sections = {e["event_id"]: e["section"] for e in payload["events"]}
-    html_sections = _html_sections(html)
+    title_of = {e.event_id: e.title for e in r.events}
 
-    # md / html 按「事件」渲染分区；非投资信号在两端是信号级一行一条（见下），
-    # 所以事件块只对 受益个股 / 仅概念关联 / 待判定：无实质传导证据 对账
-    block_sections = {k: v for k, v in json_sections.items() if v != SECTION_NON_INVESTABLE}
-    assert md_sections and md_sections == block_sections == html_sections, \
-        f"三端分区不一致 md={md_sections} json={json_sections} html={html_sections}"
+    # md / html 按「事件」渲染分区：每个事件只出现在它被判定的那个区里，
+    # 三端（JSON section / md 标题块 / html 区块）必须对得上
+    for eid, section in json_sections.items():
+        if section == SECTION_NON_INVESTABLE:
+            continue
+        md_head, html_id = SECTION_BLOCKS[section]
+        title = title_of[eid]
+        assert title in md_blocks.get(md_head, ""), f"{title} 应出现在 md「{md_head}」区"
+        assert title in html_blocks.get(html_id, ""), f"{title} 应出现在 html #{html_id} 区"
+        for other_head, other_id in SECTION_BLOCKS.values():
+            if other_head == md_head:
+                continue
+            assert title not in md_blocks.get(other_head, ""), \
+                f"{title} 不该出现在 md「{other_head}」区"
+            assert title not in html_blocks.get(other_id, ""), \
+                f"{title} 不该出现在 html #{other_id} 区"
 
     event_ids = [e.event_id for e in r.events]
     sections_by_event = {e["event_id"]: e["section"] for e in payload["events"]}
@@ -464,54 +490,56 @@ def test_three_end_sections_are_consistent():
     concept_event = next(e for e in r.events if e.doc_ids[0] == "doc-concept")
     bullish_event = next(e for e in r.events if e.doc_ids[0] == "doc-bull")
 
-    # md：降级事件只出现在「仅概念关联」区，受益区里没有它
-    md_main, md_concept = _md_block(md, "## 受益个股"), _md_block(md, "## 仅概念关联")
-    assert bullish_event.event_id in md_main and concept_event.event_id not in md_main
-    assert concept_event.event_id in md_concept and concept_event.title in md_concept
+    # md：降级事件只出现在「主题关联」区，受益区里没有它
+    md_main = _md_block(md, "## " + SECTION_LABELS[SECTION_BULLISH])
+    md_concept = _md_block(md, "## " + SECTION_LABELS[SECTION_CONCEPT_ONLY])
+    assert bullish_event.title in md_main and concept_event.title not in md_main
+    assert concept_event.title in md_concept
 
     # html：同样两块，分区标注与 md 一致
-    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
-    html_concept = html.split("<h2>仅概念关联", 1)[1].split("</h2>", 1)[1].split("<h2>", 1)[0]
-    assert bullish_event.event_id in html_main and concept_event.event_id not in html_main
-    assert concept_event.event_id in html_concept
+    html_main = html_blocks["bullish"]
+    html_concept = html_blocks["concept"]
+    assert bullish_event.title in html_main and concept_event.title not in html_main
+    assert concept_event.title in html_concept
 
-    # 非投资信号：三端同一条、同一判定依据，且不在受益区
+    # 非投资信号：三端同一条，且不在受益区；判定依据（规则话术）只留 JSON
     generic_id = "doc-generic#1"
     reason = "命中泛样板表述「扩大国内需求」且无具名产业词"
+    generic_summary = _non_investable_conclusion()["summary"][:40]
     assert payload["sections"]["非投资信号"] == [generic_id]
     # json 的事件级 section 与信号级清单必须自洽
     non_inv_events = [e for e in payload["events"] if e["section"] == SECTION_NON_INVESTABLE]
     assert [sid for e in non_inv_events for sid in e["signal_ids"]] == [generic_id]
-    assert generic_id in _md_block(md, "## 非投资信号") and reason in _md_block(md, "## 非投资信号")
-    assert generic_id not in md_main
-    html_non_inv = html.split("非投资信号（泛经济样板表述", 1)[1]
-    assert generic_id in html_non_inv and reason in html_non_inv
-    assert generic_id not in html_main
-    assert reason in md and reason in html
+    non_inv_md = _md_block(md, "## " + SECTION_LABELS[SECTION_NON_INVESTABLE])
+    non_inv_html = html_blocks["noninv"]
+    assert generic_summary in non_inv_md and generic_summary in non_inv_html
+    assert reason not in md and reason not in html, "规则式判定依据是审计信息，只留 JSON"
+    assert payload["conclusions"][2]["investable_reason"] == reason
+    assert generic_id not in md_main and generic_id not in html_main
 
 
 def test_empty_bullish_day_is_stated_on_all_three_ends():
     r = _mixed_result()
-    # 把两个真信号事件也降级 / 判非投资 → 受益区必须明确「今日无实质投资信号」
+    # 把两个真信号事件也降级 / 判非投资 → 受益区必须明确「本期暂无明确受益个股」
     for d in r.deepdives:
         d.substantive = SUBSTANTIVE_NO
     md, payload, html = render_markdown(r), json.loads(render_json(r)), render_html(r)
-    assert "今日无实质投资信号" in md
-    assert "今日无实质投资信号" in html
+    assert "本期暂无明确受益个股" in md
+    assert "本期暂无明确受益个股" in html
     assert payload["sections"]["受益个股"] == []
     assert payload["sections"]["仅概念关联"], "降级事件仍要留痕"
     assert all(e["section"] != SECTION_BULLISH for e in payload["events"])
 
 
 def test_no_vote_event_renders_under_pending_heading_not_bullish():
-    """R1 文本级：无可判定票的事件必须单列「待判定」，不得再挂在「受益个股」标题下。
+    """R1 文本级：无可判定票的事件必须单列「待确认」，不得再挂在「受益个股」标题下。
 
     md 与 html 都要按标题块断言（只查 JSON sections 不够——R1 的缺陷正是
     JSON 干净、md/html 却把「未判定」渲染在受益区标题下）。
     """
     r = _mixed_result()
-    # 受益事件的深读改成「不确定」→ 无可判定票 → 落「待判定」；
-    # 另一事件保持「否」→ 落「仅概念关联」；非投资信号不变——三区对照
+    # 受益事件的深读改成「不确定」→ 无可判定票 → 落「待确认」；
+    # 另一事件保持「否」→ 落「主题关联」；非投资信号不变——三区对照
     for d in r.deepdives:
         if d.ticker_code == "601888":
             d.substantive = SUBSTANTIVE_UNCERTAIN
@@ -519,28 +547,26 @@ def test_no_vote_event_renders_under_pending_heading_not_bullish():
     bull_event = next(e for e in r.events if e.doc_ids[0] == "doc-bull")
     concept_event = next(e for e in r.events if e.doc_ids[0] == "doc-concept")
 
-    # JSON：受益=0；无票事件进「待判定」（新旧键同值）；「否」事件进仅概念关联
+    # JSON：受益=0；无票事件进「待确认」（新旧键同值）；「否」事件进仅概念关联
     assert payload["sections"]["受益个股"] == []
     assert payload["sections"][SECTION_CONCEPT_PENDING] == [bull_event.event_id]
     assert payload["sections"]["概念关联（未做实质传导判定）"] == [bull_event.event_id]
     assert payload["sections"]["仅概念关联"] == [concept_event.event_id]
 
-    # md 文本级：受益标题块里既没有无票事件也没有「否」事件
-    md_main = _md_block(md, "## 受益个股")
-    md_pending = _md_block(md, "## 待判定：无实质传导证据")
-    assert bull_event.event_id not in md_main and concept_event.event_id not in md_main
-    assert "今日无实质投资信号" in md_main, "受益区为空要写明空日"
-    assert bull_event.event_id in md_pending and bull_event.title in md_pending
-    assert concept_event.event_id not in md_pending
+    md_main = _md_block(md, "## " + SECTION_LABELS[SECTION_BULLISH])
+    md_pending = _md_block(md, "## " + SECTION_LABELS[SECTION_CONCEPT_PENDING])
+    assert bull_event.title not in md_main and concept_event.title not in md_main
+    assert "本期暂无明确受益个股" in md_main, "受益区为空要写明空日"
+    assert bull_event.title in md_pending and concept_event.title not in md_pending
 
     # html 同样两块，口径与 md 一致
-    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
-    html_pending = (html.split("<h2>待判定：无实质传导证据", 1)[1]
-                    .split("</h2>", 1)[1].split("<h2>", 1)[0])
-    assert bull_event.event_id not in html_main and concept_event.event_id not in html_main
-    assert "今日无实质投资信号" in html_main
-    assert bull_event.event_id in html_pending
-    assert concept_event.event_id not in html_pending
+    html_blocks = _html_blocks(html)
+    html_main = html_blocks["bullish"]
+    html_pending = html_blocks["pending"]
+    assert bull_event.title not in html_main and concept_event.title not in html_main
+    assert "本期暂无明确受益个股" in html_main
+    assert bull_event.title in html_pending
+    assert concept_event.title not in html_pending
 
 
 # ---- CR-1：主题证据校验（同义改写漏判 + 具名项目误杀，双向验证） ----
@@ -812,16 +838,17 @@ def test_wan15_timor_article_ends_in_concept_only_with_zero_bullish(tmp_path, mo
     assert all(d["substantive"] == "否" for d in payload["deepdives"])
 
     md = render_markdown(result)
-    assert "## 仅概念关联" in md
-    assert events[0].event_id in _md_block(md, "## 仅概念关联")
-    assert "## 受益个股" in md and "今日无实质投资信号" in md
+    concept_head = "## " + SECTION_LABELS[SECTION_CONCEPT_ONLY]
+    assert concept_head in md
+    assert events[0].title in _md_block(md, concept_head)
+    assert "## 受益个股" in md and "本期暂无明确受益个股" in md
 
     # R1 文本级：全「否」（0 张是票）的事件在 md/html 都不得出现在受益区标题下
     html = render_html(result)
-    md_main = _md_block(md, "## 受益个股")
-    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
-    assert events[0].event_id not in md_main, "无票事件不得挂在「受益个股」标题下"
-    assert events[0].event_id not in html_main, "html 同口径"
+    md_main = _md_block(md, "## " + SECTION_LABELS[SECTION_BULLISH])
+    html_main = _html_blocks(html)["bullish"]
+    assert events[0].title not in md_main, "无票事件不得挂在「受益个股」标题下"
+    assert events[0].title not in html_main, "html 同口径"
     store.close()
 
 
@@ -878,8 +905,7 @@ def test_wan15_positive_control_order_signal_still_upgrades(tmp_path, monkeypatc
 
     # 文本级正向对照：事件确实渲染在「受益个股」标题块下
     md = render_markdown(result)
-    assert events[0].event_id in _md_block(md, "## 受益个股")
+    assert events[0].title in _md_block(md, "## " + SECTION_LABELS[SECTION_BULLISH])
     html = render_html(result)
-    html_main = html.split("<h2>受益个股</h2>", 1)[1].split("<h2>", 1)[0]
-    assert events[0].event_id in html_main
+    assert events[0].title in _html_blocks(html)["bullish"]
     store.close()

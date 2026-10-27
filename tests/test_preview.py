@@ -11,6 +11,7 @@ import statistics
 import pytest
 
 from policypulse.config import Settings, default_paths
+from policypulse.report import SECTION_LABELS
 from policypulse.preview import (
     aggregate,
     benchmark_pct,
@@ -192,15 +193,19 @@ def test_render_preview_html_contract():
     agg = aggregate(rows, [])
     agg["bench_pct"] = 1.5
     agg["excess"] = round(agg["avg"] - 1.5, 2)
-    page = render_preview("2026-10-22", rows, [], agg,
-                          "日报 JSON 2026-10-22.json", "2026-10-23 10:00:00")
+    page = render_preview("2026-10-22", rows, [], agg, "2026-10-23 10:00:00")
     assert "<script" not in page
     assert "600000" in page and "甲银行" in page
     assert "+15.00%" in page
-    assert "验证 ·" in page and "口径说明" in page
+    assert "日报个股走势复盘" in page and "读这一页需要知道的" in page
     assert "沪深300ETF" in page
     assert "红涨绿跌" in page
     assert "<svg" in page  # 组合曲线 + 迷你走势线
+    # 复盘页同样不摆实现细节：不出现取数实现、内部文件与行业术语
+    for word in ("tongstock", "quote", ".json", "分区", "口径"):
+        assert word not in page, f"复盘页里不该出现实现层内容：{word}"
+    # 分区标签用读者话术，不用内部键名
+    assert SECTION_LABELS["受益个股"] in page
 
 
 def test_build_preview_writes_page_and_opens_browser(tmp_path, monkeypatch):

@@ -1,7 +1,11 @@
-"""日报渲染：Markdown（主交付）+ JSON + 单页 HTML。
+"""日报渲染：Markdown（主交付）+ JSON（结构化）+ 单页 HTML（浏览器阅读）。
 
 正文按「政策事件」组织（同文档/同发布会的信号聚成一条事件，个股按代码去重一张表），
 不再逐条信号重复贴一模一样的个股表。
+
+**md / html 是给读者看的**：运行期指标（run_id、抓取告警、快照路径、事件/信号内部 ID、
+robots 合规台账、闸门统计、复核命令）一律不进这两个出口——它们留在 JSON 与数据库里
+供复核。正文只讲三件事：政策说了什么、会怎么传导、落在哪些公司上。
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ from policypulse.config import (
     GATE_CAVEAT,
     INVESTABLE_CAVEAT,
     MAPPING_CAVEAT,
-    REPO_ROOT,
     Settings,
 )
 from policypulse.deepdive import substantive_verdict
@@ -41,36 +44,110 @@ LEGACY_SECTION_CONCEPT_PENDING = "概念关联（未做实质传导判定）"
 # 只有「受益个股」算主区；待判定单列成节，不再进受益区
 MAIN_SECTIONS = (SECTION_BULLISH,)
 
+# 展示文案：JSON 里的分区键保持不变（机器可读、老解析方不破），
+# md / html 的标题换成读者一眼能懂的说话方式——不再出现「闸门」「分区」「深读判定」
+# 这类实现层词汇。
+SECTION_LABELS = {
+    SECTION_BULLISH: "受益个股",
+    SECTION_CONCEPT_ONLY: "主题关联",
+    SECTION_CONCEPT_PENDING: "待确认：暂无实质传导证据",
+    SECTION_NON_INVESTABLE: "泛政策表述",
+}
+
+SECTION_NOTES = {
+    SECTION_BULLISH: "政策明确指向具体行业，下列个股按政策受益度从高到低排列。",
+    SECTION_CONCEPT_ONLY: "政策与下列行业有关，但本期没有找到足以判断「会实质影响公司业绩」的证据，"
+                          "仅作主题参考，不算受益结论。",
+    SECTION_CONCEPT_PENDING: "这些政策事件本期还没有做出实质影响判断，先列出可关联的主题与个股，"
+                             "不作为受益结论。",
+    SECTION_NON_INVESTABLE: "以下表述偏整体性、方向性，没有指向具体行业或公司，本期不展开个股分析。",
+}
+
+STRENGTH_WORDS = {1: "弱", 2: "偏弱", 3: "中等", 4: "较强", 5: "强"}
+HORIZON_WORDS = (("短期", "短期（1 个月内）"), ("中期", "中期（1–6 个月）"),
+                 ("长期", "长期（6 个月以上）"))
+SUBSTANTIVE_LABELS = {"是": "有实质影响", "否": "无实质影响", "不确定": "待确认"}
+
 
 def _esc(text) -> str:
     return html.escape(str(text or ""))
 
 
-def relative_snapshot(path: str) -> str:
-    """Markdown 里写相对仓库根的路径；JSON/DB 仍保留绝对路径。"""
+# ----------------------------------------------------------------- 读者语言
+
+def strength_label(value) -> str:
+    """1–5 的力度分数 → 「4/5（较强）」：保留原始分数，同时给读者一个刻度感。"""
     try:
-        return Path(path).resolve().relative_to(REPO_ROOT.resolve()).as_posix()
-    except (ValueError, OSError):
-        return path
+        n = int(value)
+    except (TypeError, ValueError):
+        return str(value or "—")
+    word = STRENGTH_WORDS.get(n)
+    return f"{n}/5（{word}）" if word else f"{n}/5"
 
 
-def _compliance_lines(result: RunResult) -> list[str]:
-    """逐源合规台账：robots 判定 + 本轮文档数。停用/本地源明确写「不发起请求」。"""
-    rows = result.stats.get("sources_detail") or []
-    if not rows:
-        return []
-    lines = ["## 信息源与合规", "",
-             "| 源ID | 机构 | 状态 | robots 判定 | 判定依据 | 本轮文档 | 本轮去向 |",
-             "|---|---|---|---|---|---|---|"]
-    for row in rows:
-        flag = "启用" if row["enabled"] else "停用"
-        reason = row["robots_reason"]
-        if len(reason) > 60:
-            reason = reason[:59] + "…"
-        lines.append(f"| `{row['id']}` | {row['org']} | {flag} | {row['robots']} | "
-                     f"{reason} | {row['docs']} | {row.get('outcome', '—')} |")
-    lines.append("")
-    return lines
+def horizon_label(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "—"
+    for key, label in HORIZON_WORDS:
+        if text.startswith(key):
+            return label
+    return text
+
+
+def confidence_label(value) -> str:
+    """模型研判可信度：0–1 的原始值 + 高/中/偏低的口径词。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    word = "高" if num >= 0.8 else ("中" if num >= 0.6 else "偏低")
+    return f"{word}（{num:.2f}）"
+
+
+def substantive_label(value) -> str:
+    return SUBSTANTIVE_LABELS.get(str(value or "").strip(), "待确认")
+
+
+def _brief(text, limit: int = 40) -> str:
+    """表格里的长句截断到一行宽，截断处留省略号（不静默丢字）。"""
+    s = str(text or "").strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _theme_text(c: dict) -> str:
+    return "、".join(c.get("theme_tags") or []) or "—"
+
+
+def _instrument_text(c: dict) -> str:
+    return "、".join(c.get("instruments") or []) or "—"
+
+
+def _source_meta(ev) -> list[str]:
+    """事件头一行的来源信息：机构 · 会议/文件类型 · 发布日期。"""
+    meta = [ev.org or "来源未标注", ev.meeting_type or "", ev.published_at or "发布日期未标注"]
+    return [m for m in meta if m]
+
+
+def _pick_caption(caps: "PickCaps") -> str:
+    """选股口径（md / html 共用一句），说清「最多几只、怎么排」。"""
+    if caps.global_cap > 0:
+        return (f"整份日报最多列出 {caps.global_cap} 只个股：跨政策事件按代码去重，"
+                f"按综合评分从高到低取前 {caps.global_cap} 只；单个事件最多 {caps.per_event} 只，"
+                f"候选不足时按实际数量列出，不补位。")
+    return (f"每个政策事件按综合评分从高到低最多列 {caps.per_event} 只，"
+            f"候选不足时按实际数量列出，不补位。")
+
+
+def _metric_caption() -> str:
+    return ("综合评分：政策力度、公司与主题的业务相关度、市值流动性与政策性质加权所得（0–100），"
+            "越高表示政策受益度越高，也越靠前；主题相关度：公司与该政策主题的业务匹配程度（0–1）。")
+
+
+def _empty_event_notice(caps: "PickCaps") -> str:
+    if caps.global_cap > 0:
+        return f"本事件的相关个股未进入本期名单（整份日报最多 {caps.global_cap} 只），此处不列个股表。"
+    return "本事件的相关个股暂无足够数据，此处不列个股表。"
 
 
 def _is_bullish(c: dict, min_strength: int) -> bool:
@@ -186,215 +263,182 @@ def _event_ticker_rows(ev, caps: PickCaps) -> list[dict]:
     return [t for t in ev.tickers if t.get("ticker_code") in allowed]
 
 
-def _pick_caption(caps: PickCaps) -> str:
-    """口径说明（md / html 共用一句，避免两端各写一套）。"""
-    if caps.global_cap > 0:
-        return (f"选股上限：整份日报全局最多 {caps.global_cap} 只——跨事件按代码去重、"
-                f"按 score（越高 = 相对上涨概率越大）降序取前 {caps.global_cap}；"
-                f"事件内不超过 {caps.per_event} 只，候选不足按实际数量列出，不补位。")
-    return (f"选股上限：全局截断已关闭（`global_max_picks: 0`），每个政策事件按 score "
-            f"降序最多列 {caps.per_event} 只；候选不足按实际数量列出，不补位。")
-
-
 def _qualifying(ev, min_strength: int) -> list[dict]:
     return [c for c in ev.conclusions if _is_bullish(c, min_strength)]
 
 
-def _render_event(lines: list[str], ev, qualifying: list[dict], min_strength: int,
-                  section: str, index: int, caps: PickCaps) -> None:
-    # 先按全局允许集过滤，再按 score 降序去重、截断到事件上限——与逻辑层同一口径，
-    # 渲染层不会因为「筛过一遍结论」把上限放大回去，也不会脱钩全局 Top-N
-    rows = merge_tickers(_restrict_tickers(qualifying, _event_allowed(caps, ev)),
+def _event_picks(ev, qualifying: list[dict], caps: PickCaps) -> list[dict]:
+    """渲染层个股行：先按全局允许集过滤，再按 score 降序去重、截断到事件上限。
+
+    与逻辑层同一口径——渲染层不会因为「筛过一遍结论」把上限放大回去，
+    也不会脱钩全局 Top-N。
+    """
+    return merge_tickers(_restrict_tickers(qualifying, _event_allowed(caps, ev)),
                          caps.per_event)
-    doc_count = len(ev.doc_ids)
+
+
+# ------------------------------------------------------------------ 概览/来源
+
+def _source_count(stats: dict) -> int:
+    """来源渠道数：优先用统计里的成功数，回落到合规台账里启用的源数。"""
+    ok = int(stats.get("sources_ok") or 0)
+    if ok:
+        return ok
+    return len([r for r in (stats.get("sources_detail") or []) if r.get("enabled", True)])
+
+
+def _overview_lines(result: RunResult, events: list, caps: PickCaps,
+                    min_strength: int) -> list[str]:
+    """读者视角的概览：只看「本期有哪些政策、落到哪些公司」，不看管道指标。"""
+    s = result.stats
+    orgs = []
+    for ev in events:
+        if ev.org and ev.org not in orgs:
+            orgs.append(ev.org)
+    org_text = "、".join(orgs[:3]) + (f" 等 {len(orgs)} 个渠道" if len(orgs) > 3 else "")
+    displayed = sum(len(_event_picks(ev, _qualifying(ev, min_strength), caps)) for ev in events)
+    with_tickers = s.get("with_tickers", 0)
+    lines = ["## 本期概览", ""]
+    lines.append(f"- **统计区间**：{result.window_start} ~ {result.window_end}"
+                 + (f"（{s['window_days']} 天）" if s.get("window_days") else ""))
+    lines.append(f"- **政策事件**：{s.get('events', len(events))} 起"
+                 + (f"，来自 {org_text}" if org_text else ""))
+    lines.append(f"- **政策信号**：{s.get('signals', len(result.conclusions))} 条"
+                 + (f"，其中 {with_tickers} 条落到具体行业与个股" if with_tickers else ""))
+    lines.append(f"- **列出个股**：{displayed} 只")
+    if _source_count(s):
+        lines.append(f"- **信息来源**：{_source_count(s)} 个官方渠道")
+    lines.append("")
+    return lines
+
+
+def _source_rows(stats: dict) -> list[tuple[str, int]]:
+    """启用的信息源按机构合并（同一机构常有多条栏目源，读者只关心这家机构收了多少篇）。"""
+    merged: dict[str, int] = {}
+    for r in (stats.get("sources_detail") or []):
+        if not r.get("enabled", True):
+            continue
+        org = str(r.get("org") or r.get("id") or "")
+        if org:
+            merged[org] = merged.get(org, 0) + int(r.get("docs") or 0)
+    return list(merged.items())
+
+
+def _source_lines(stats: dict) -> list[str]:
+    """信息来源：机构 + 本期收录篇数。robots 判定等合规细节留在 JSON，不进正文。"""
+    rows = _source_rows(stats)
+    if not rows:
+        return []
+    lines = ["## 信息来源", "", "| 机构 | 本期收录 |", "|---|---|"]
+    for org, docs in rows:
+        lines.append(f"| {org} | {f'{docs} 篇' if docs else '无更新'} |")
+    lines.append("")
+    failed = int(stats.get("sources_failed") or 0)
+    if failed:
+        lines.append(f"> 本期有 {failed} 个渠道访问失败，可能影响覆盖完整性。")
+        lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------- Markdown
+
+def _render_event(lines: list[str], ev, qualifying: list[dict], index: int,
+                  caps: PickCaps) -> None:
+    rows = _event_picks(ev, qualifying, caps)
     lines.append(f"### {index}. {ev.title}")
     lines.append("")
-    lines.append(f"- 事件ID：`{ev.event_id}`（合并 {doc_count} 篇文档）")
-    lines.append(f"- 分区：{section}")
-    lines.append(f"- 来源：{ev.org or '—'} · {ev.meeting_type or '—'} · "
-                 f"{ev.published_at or '日期未知'}")
-    lines.append(f"- 原文：[{ev.source_url}]({ev.source_url})")
-    lines.append(f"- 快照：`{relative_snapshot(ev.snapshot_path)}`")
-    lines.append(f"- 事件内信号 {len(ev.conclusions)} 条，其中力度 ≥ {min_strength} 且有映射 "
-                 f"{len(qualifying)} 条")
+    lines.append(f"{' · '.join(_source_meta(ev))} · [查看政策原文]({ev.source_url})")
     lines.append("")
     for c in qualifying:
-        lines.append(f"#### `{c['signal_id']}` {c['summary']}")
+        lines.append(f"**{c['summary']}**")
         lines.append("")
-        lines.append(f"- 信号ID：`{c['signal_id']}`")
-        lines.append(f"- 力度/周期/性质：strength **{c['strength']}** / {c['horizon']} / {c['novelty']}")
-        lines.append(f"- 主题：{', '.join(c['theme_tags']) or '—'}")
-        lines.append(f"- 工具：{', '.join(c['instruments']) or '—'}")
-        lines.append(f"- 置信度：{c['confidence']}（引用校验：{'通过' if c['quote_verified'] else '未通过'}）")
-        lines.append(f"- 来源：{c['org']} · {c['meeting_type']} · {c['published_at'] or '日期未知'}")
-        lines.append(f"- 原文：{_source_links(c)}")
-        lines.append(f"- 快照：`{relative_snapshot(c['raw_snapshot_path'])}`")
+        lines.append(f"- 影响力度 {strength_label(c['strength'])}"
+                     f" · 影响周期 {horizon_label(c['horizon'])}"
+                     f" · 政策性质 {c['novelty'] or '—'}")
+        lines.append(f"- 涉及主题：{_theme_text(c)}")
+        lines.append(f"- 政策工具：{_instrument_text(c)}")
+        lines.append(f"- 研判可信度：{confidence_label(c['confidence'])}")
         lines.append("")
         lines.append(f"> {c['quote']}")
         lines.append("")
     if not rows:
-        lines.append(f"- 个股：本事件个股未进入全局选股 Top-{caps.global_cap}，不列个股表。")
+        lines.append(f"- {_empty_event_notice(caps)}")
         lines.append("")
         return
-    lines.append("| # | 代码 | 名称 | 板块 | 市值(亿) | score | 相关性 | 受益理由 | 映射路径 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("| # | 代码 | 名称 | 所属板块 | 市值（亿元） | 综合评分 | 主题相关度 | 受益理由 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for i, t in enumerate(rows, start=1):
         rel = t.get("relevance", t.get("mapping_confidence", 0))
         lines.append(
-            f"| {i} | {t['ticker_code']} | {t['ticker_name']} | "
-            f"{t['sector_name']}({t['sector_source']}) | {t['market_cap']:.1f} | {t['score']} | "
-            f"{rel} | {t['why']} | {t['mapping_path']} |"
+            f"| {i} | {t['ticker_code']} | {t['ticker_name']} | {t['sector_name']} | "
+            f"{t['market_cap']:.1f} | {t['score']} | {rel} | {t['why']} |"
         )
     lines.append("")
 
 
 def _non_investable_lines(conclusions: list[dict]) -> list[str]:
-    """非投资信号区：一行一条，带判定依据与原文链接，方便逐条复核判定。"""
+    """泛政策表述区：一行一条，只说「这条没指向具体行业」，不摆判定规则。"""
     rows = [c for c in conclusions if not c.get("investable", True)]
     if not rows:
         return []
-    lines = ["## 非投资信号（泛经济样板表述，不映射板块、不展开个股）", "",
-             "| 信号ID | 摘要 | 判定依据 | 原文 |",
-             "|---|---|---|---|"]
+    lines = [f"## {SECTION_LABELS[SECTION_NON_INVESTABLE]}", "",
+             f"> {SECTION_NOTES[SECTION_NON_INVESTABLE]}", "",
+             "| 政策表述 | 原文 |", "|---|---|"]
     for c in rows:
-        reason = c.get("investable_reason", "") or "—"
-        lines.append(f"| `{c['signal_id']}` | {c['summary'][:40]} | {reason} | "
-                     f"[{c['org']}]({c['source_url']}) |")
+        lines.append(f"| {_brief(c['summary'])} | [{c['org']}]({c['source_url']}) |")
     lines.append("")
     return lines
 
 
-def _gate_line(gate: dict) -> str:
-    if not gate:
-        return "—"
-    labels = {"profile_hit": "业务命中放行", "weak_hit": "经营范围弱命中",
-              "no_profile": "无画像放行", "unparsed_profile": "F10已取未解析放行",
-              "profile_miss": "无实质交集",
-              "disabled": "闸门关闭", "dropped": "直接剔除"}
-    parts = [f"{labels.get(k, k)} {v}" for k, v in gate.items() if v]
-    return "、".join(parts) or "—"
-
-
-def _source_links(c: dict) -> str:
-    return f"[{c['source_url']}]({c['source_url']})"
-
-
-def render_markdown(result: RunResult) -> str:
-    s = result.stats
-    min_strength = s.get("min_strength_for_report", 3)
-    events = _ensure_events(result)
-    caps = pick_caps(s, events)
-    lines: list[str] = []
-    lines.append(f"# PolicyPulse 日报 {result.window_end}")
+def _other_signal_lines(conclusions: list[dict], rendered_ids: set[str]) -> list[str]:
+    """其他政策信号：中性/偏空/影响有限/暂未落到板块的信号，供读者知道「还有这些」。"""
+    rows = [c for c in conclusions
+            if c["signal_id"] not in rendered_ids and c.get("investable", True)]
+    if not rows:
+        return []
+    lines = ["## 其他政策信号（中性、偏空或影响有限）", "",
+             "> 这些信号本期没有形成明确的受益个股，仅作记录。", "",
+             "| 方向 | 影响力度 | 政策信号 | 原文 |", "|---|---|---|---|"]
+    for c in rows:
+        lines.append(f"| {c['direction']} | {strength_label(c['strength'])} | "
+                     f"{_brief(c['summary'])} | [{c['org']}]({c['source_url']}) |")
     lines.append("")
-    lines.append(f"> {DISCLAIMER}")
-    lines.append("")
-    lines.append("## 今日概览")
-    lines.append("")
-    lines.append("| 指标 | 值 |")
-    lines.append("|---|---|")
-    lines.append(f"| 统计窗口 | {result.window_start} ~ {result.window_end}"
-                 f"（{s.get('window_days', '?')} 天） |")
-    lines.append(f"| run_id | `{result.run_id}` |")
-    lines.append(f"| 窗口内文档（入库+复用） | {s['docs']} |")
-    reused = s.get("reused_docs", 0)
-    if reused:
-        lines.append(f"| 其中复用库内（信号不重抽） | {reused} |")
-    lines.append(f"| 政策事件（聚类后） | {s.get('events', len(events))} |")
-    lines.append(f"| 报告信号总数（含复用） | {s['signals']} |")
-    extracted = s.get("signals_extracted")
-    if extracted is not None and extracted != s["signals"]:
-        lines.append(f"| 本 run 新抽取信号 | {extracted} |")
-    lines.append(f"| 有映射个股的信号 | {s['with_tickers']} |")
-    non_inv = s.get("non_investable_signals", 0)
-    gate_off = not s.get("investable_gate", True)
-    lines.append(f"| 信号级可投资性闸门 | "
-                 f"{'关闭（全部按可投资处理）' if gate_off else f'非投资信号 {non_inv} 条'} |")
-    lines.append(f"| 个股结论行（按信号累计） | {s['ticker_rows']} |")
-    ticker_event = s.get("ticker_rows_event")
-    if ticker_event is not None:
-        lines.append(f"| 个股（事件内按代码去重后） | {ticker_event} |")
-    if caps.global_cap > 0:
-        lines.append(f"| 全局入选个股（上限 {caps.global_cap}） | "
-                     f"{len(caps.allowed or set())} |")
-    lines.append(f"| 信息源（discover 成功/网络源） | "
-                 f"{s.get('sources_ok', 0)} / {s['sources_total']} |")
-    lines.append(f"| 抓取失败条目 | {s.get('fetch_failures', 0)} |")
-    lines.append(f"| 复用库内文档（跨 run 去重） | {s.get('duplicates_skipped', 0)} |")
-    lines.append(f"| 窗口外剔除（详情页日期） | {s.get('out_of_window_docs', 0)} |")
-    cached = s.get("out_of_window_cached", 0)
-    if cached:
-        lines.append(f"| 窗口外旧 URL 缓存跳过（未重复请求） | {cached} |")
-    short_body = s.get("short_body_skipped", 0)
-    if short_body:
-        lines.append(f"| 正文过短剔除 | {short_body} |")
-    lines.append(f"| 公司级相关性闸门 | {_gate_line(s.get('gate', {}))} |")
-    lines.append(f"| 个股深度研读 | {s.get('deepdive_count', 0)} 条 |")
-    lines.append(f"| LLM 抽取 | {'开启' if s['llm_enabled'] else '关闭（规则抽取）'} |")
-    lines.append(f"| tongstock 调用（不含缓存命中） | {s['tongstock_calls']} |")
-    pbc_docs = s.get("pbc_related_docs", 0)
-    pbc_src = s.get("pbc_related_sources") or []
-    lines.append(f"| 央行（中国人民银行）相关文档 | {pbc_docs}"
-                 f"{'（来源：' + '、'.join(pbc_src) + '）' if pbc_src else ''} |")
-    lines.append("")
-    lines.append(f"> 口径说明：{MAPPING_CAVEAT}")
-    lines.append("")
-    lines.append(f"> {INVESTABLE_CAVEAT}")
-    lines.append("")
-    lines.append(f"> {GATE_CAVEAT}")
-    lines.append("")
+    return lines
 
-    warned: list[str] = list(result.failed_sources) + list(result.warnings)
-    if warned:
-        lines.append("### 抓取告警")
-        lines.append("")
-        # 30：窗口外剔除改为逐条告警后，15 条会把明细截掉，数字就不可回溯了
-        for item in warned[:30]:
-            lines.append(f"- {item}")
-        lines.append("")
 
-    if result.duplicates_skipped:
-        lines.append(f"- 另有 {result.duplicates_skipped} 篇文档正文指纹已在库："
-                     "直接复用库内信号与个股展开（不重复抽取，仍完整进入本报告）。")
+def _deepdive_lines(result: RunResult) -> list[str]:
+    """个股深度研判：每只入选个股的政策传导、竞争地位、影响判断与风险。"""
+    dives = list(getattr(result, "deepdives", None) or [])
+    if not dives:
+        return []
+    lines = ["## 个股深度研判", "",
+             "> 针对本期入选个股，逐只说明政策怎么传导到公司、公司处在什么位置、"
+             "以及需要留意的风险。", ""]
+    for d in dives:
+        lines.append(f"### {d.ticker_name}（{d.ticker_code}）· {d.policy_title}")
         lines.append("")
-    out_window = s.get("out_of_window_docs", 0)
-    if out_window:
-        lines.append(f"- {out_window} 篇文档的详情页发布日期落在统计窗口外，已剔除"
-                     "（列表页无日期的源靠详情页日期兜底判定，不进当日日报）。")
+        if d.policy_summary:
+            lines.append(f"- 主题关联：{d.policy_summary}")
+        if d.transmission:
+            lines.append(f"- 传导路径：{d.transmission}")
+        if d.competition:
+            lines.append(f"- 竞争地位：{d.competition}")
+        if d.impact:
+            lines.append(f"- 影响判断：{d.impact}")
+        if getattr(d, "substantive", ""):
+            lines.append(f"- 实质影响：{substantive_label(d.substantive)}")
+        if d.risks:
+            lines.append(f"- 风险提示：{'；'.join(d.risks)}")
+        # 拼好再嵌入：嵌套同引号 f-string 是 PEP 701（仅 3.12+），3.10/3.11 直接 SyntaxError
+        src_lines = [f"{x['label']}（`{x['ref']}`）" for x in d.sources]
+        if src_lines:
+            lines.append(f"- 溯源：{'; '.join(src_lines)}")
         lines.append("")
-    cached = s.get("out_of_window_cached", 0)
-    if cached:
-        lines.append(f"- {cached} 篇旧稿此前已判定窗口外，按库内缓存直接跳过，本轮未重复请求详情页。")
-        lines.append("")
-    short_body = s.get("short_body_skipped", 0)
-    if short_body:
-        lines.append(f"- {short_body} 篇候选正文长度不足阈值（min_body_length），未入库。")
-        lines.append("")
-    no_update = s.get("sources_no_update") or []
-    if no_update:
-        lines.append(f"- 窗口内无更新的源：{'、'.join(no_update)}（如实记录，不再回退抓旧稿）。")
-        lines.append("")
+    return lines
 
-    if not result.conclusions:
-        lines.append("## 今日无新增政策 / 事件")
-        lines.append("")
-        lines.append(f"统计窗口 {result.window_start} ~ {result.window_end} 内没有抓到新文档，"
-                     "或文档未产生可映射的信号。需要更早的稿子请显式回补："
-                     "`policypulse run --since N`。")
-        lines.append("")
-        lines.extend(_compliance_lines(result))
-        lines.append("## 运行元信息")
-        lines.append("")
-        lines.append(f"- 数据库：`data/policypulse.db`（run_id `{result.run_id}`）")
-        lines.append("")
-        lines.append(f"> {DISCLAIMER}")
-        return "\n".join(lines)
 
-    bullish_all = [c for c in result.conclusions if c["direction"] == "利好" and c["tickers"]]
-    bullish = [c for c in bullish_all if c["strength"] >= min_strength]
-    filtered_out = len(bullish_all) - len(bullish)
-    bullish.sort(key=lambda c: (-c["strength"], -c["confidence"]))
-
+def _partition(result, events, min_strength: int):
+    """分区共用：md / json / html 三端都从这里拿同一批结果。"""
     deepdives = list(getattr(result, "deepdives", None) or [])
     verdicts = _verdicts_by_event(deepdives)
     totals = _totals_by_event(deepdives)
@@ -405,86 +449,67 @@ def render_markdown(result: RunResult) -> str:
                       if sections[ev.event_id] == SECTION_CONCEPT_ONLY and _qualifying(ev, min_strength)]
     pending_events = [ev for ev in events
                       if sections[ev.event_id] == SECTION_CONCEPT_PENDING and _qualifying(ev, min_strength)]
+    return verdicts, totals, sections, main_events, concept_events, pending_events
 
-    lines.append("## 受益个股")
+
+def render_markdown(result: RunResult) -> str:
+    s = result.stats
+    min_strength = s.get("min_strength_for_report", 3)
+    events = _ensure_events(result)
+    caps = pick_caps(s, events)
+    lines: list[str] = [f"# PolicyPulse 日报 · {result.window_end}", ""]
+    lines.extend(_overview_lines(result, events, caps, min_strength))
+
+    if not result.conclusions:
+        lines.append(f"## {EMPTY_DAY_NOTICE}")
+        lines.append("")
+        lines.append(f"统计区间 {result.window_start} ~ {result.window_end} 内没有新的"
+                     "政策发布或会议通稿，本期无新增内容。")
+        lines.append("")
+        lines.extend(_source_lines(s))
+        lines.append(f"> {DISCLAIMER}")
+        return "\n".join(lines)
+
+    (_, _, _, main_events,
+     concept_events, pending_events) = _partition(result, events, min_strength)
+
+    lines.append(f"## {SECTION_LABELS[SECTION_BULLISH]}")
     lines.append("")
     lines.append(f"> {_pick_caption(caps)}")
     lines.append("")
-    if filtered_out:
-        lines.append(f"另有 {filtered_out} 条利好结论力度 < {min_strength}，未列入本表，详见同名 JSON 与数据库。")
-        lines.append("")
-    if not bullish:
-        lines.append(f"本轮没有命中「利好、有板块映射且力度 ≥ {min_strength}」的信号。")
-        lines.append("")
+    lines.append(f"> {_metric_caption()}")
+    lines.append("")
     if not main_events:
-        lines.append("**今日无实质投资信号**：没有深读明判「有实质影响」的政策事件。"
-                     "下面是仅概念关联、待判定与非投资信号留痕。")
+        lines.append("本期暂无明确受益个股：没有找到「政策明确指向、且能落到具体公司」的事件。"
+                     "下面按主题关联与政策留痕列出，供参考。")
         lines.append("")
     for i, ev in enumerate(main_events, start=1):
-        _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                      sections[ev.event_id], i, caps)
+        _render_event(lines, ev, _qualifying(ev, min_strength), i, caps)
 
     if concept_events:
-        lines.append("## 仅概念关联（深读判定无实质传导，不授予受益头衔）")
+        lines.append(f"## {SECTION_LABELS[SECTION_CONCEPT_ONLY]}")
+        lines.append("")
+        lines.append(f"> {SECTION_NOTES[SECTION_CONCEPT_ONLY]}")
         lines.append("")
         for i, ev in enumerate(concept_events, start=1):
-            _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                          sections[ev.event_id], i, caps)
+            _render_event(lines, ev, _qualifying(ev, min_strength), i, caps)
 
     if pending_events:
-        lines.append("## 待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）")
+        lines.append(f"## {SECTION_LABELS[SECTION_CONCEPT_PENDING]}")
+        lines.append("")
+        lines.append(f"> {SECTION_NOTES[SECTION_CONCEPT_PENDING]}")
         lines.append("")
         for i, ev in enumerate(pending_events, start=1):
-            _render_event(lines, ev, _qualifying(ev, min_strength), min_strength,
-                          sections[ev.event_id], i, caps)
+            _render_event(lines, ev, _qualifying(ev, min_strength), i, caps)
 
+    # 「其他政策信号」只收正文事件块里没出现过的信号，避免同一条写两遍
+    rendered_ids = {c["signal_id"]
+                    for ev in main_events + concept_events + pending_events
+                    for c in _qualifying(ev, min_strength)}
+    lines.extend(_other_signal_lines(result.conclusions, rendered_ids))
     lines.extend(_non_investable_lines(result.conclusions))
-
-    bullish_ids = {c["signal_id"] for c in bullish}
-    others = [c for c in result.conclusions
-              if c["signal_id"] not in bullish_ids and c.get("investable", True)]
-    if others:
-        lines.append("## 其余信号（中性/利空/力度不足/无映射）")
-        lines.append("")
-        lines.append("| 信号ID | 方向 | 力度 | 摘要 | 来源 |")
-        lines.append("|---|---|---|---|---|")
-        for c in others:
-            lines.append(f"| `{c['signal_id']}` | {c['direction']} | {c['strength']} | "
-                         f"{c['summary'][:40]} | [{c['org']}]({c['source_url']}) |")
-        lines.append("")
-
-    if deepdives:
-        lines.append("## 个股深度研读（每条结论均带溯源）")
-        lines.append("")
-        for d in deepdives:
-            lines.append(f"### {d.ticker_name}（{d.ticker_code}）· {d.policy_title}")
-            lines.append("")
-            lines.append(f"- 政策：{d.policy_summary}")
-            lines.append(f"- 传导路径：{d.transmission}")
-            lines.append(f"- 竞争地位：{d.competition}")
-            lines.append(f"- 影响判断：{d.impact}")
-            if getattr(d, "substantive", ""):
-                lines.append(f"- 实质影响判定：{d.substantive}（语义判定，决定事件分区）")
-            if d.risks:
-                lines.append(f"- 风险提示：{'；'.join(d.risks)}")
-            # 拼好再嵌入：嵌套同引号 f-string 是 PEP 701（仅 3.12+），3.10/3.11 直接 SyntaxError
-            src_lines = [f"{x['label']}（`{x['ref']}`）" for x in d.sources]
-            lines.append(f"- 溯源：{'; '.join(src_lines)}")
-            lines.append("")
-
-    lines.extend(_compliance_lines(result))
-
-    lines.append("## 运行元信息")
-    lines.append("")
-    snap_dirs = sorted({str(Path(d.snapshot_path).parent) for d in result.docs})
-    snap_text = "、".join(f"`{relative_snapshot(p)}`" for p in snap_dirs[:3]) or "—"
-    if len(snap_dirs) > 3:
-        snap_text += f"（等 {len(snap_dirs)} 个目录，含复用文档的历史快照目录）"
-    lines.append(f"- 快照目录：{snap_text}")
-    lines.append(f"- 数据库：`data/policypulse.db`（run_id `{result.run_id}`）")
-    lines.append(f"- 复核命令：`policypulse verify --run {result.run_id}`")
-    lines.append(f"- 单信号溯源：`policypulse show {result.conclusions[0]['signal_id'] if result.conclusions else '<signal_id>'}`")
-    lines.append("")
+    lines.extend(_deepdive_lines(result))
+    lines.extend(_source_lines(s))
     lines.append(f"> {DISCLAIMER}")
     return "\n".join(lines)
 
@@ -544,91 +569,277 @@ def render_json(result: RunResult) -> str:
             for d in deepdives
         ],
         "disclaimer": DISCLAIMER,
+        # 三条口径说明仅供机器/复核方读取：md / html 正文不再印这些规则话术
         "mapping_caveat": MAPPING_CAVEAT,
         "investable_caveat": INVESTABLE_CAVEAT,
+        "gate_caveat": GATE_CAVEAT,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def _event_html(ev, verdicts_by_event: dict[str, list[bool]],
-                totals_by_event: dict[str, int] | None, min_strength: int,
-                caps: PickCaps) -> str:
+# ------------------------------------------------------------------------- HTML
+
+_PAGE_CSS = """
+:root{
+--ink:#131a26;--ink-soft:#3b4757;--muted:#6b7a90;--line:#e6eaf2;--bg:#f4f6fb;--card:#fff;
+--navy:#152a45;--navy-2:#203f63;--gold:#b8860b;--gold-soft:#fdf7e7;
+--green:#0f7a55;--green-soft:#eaf7f1;--blue:#1d4ed8;--blue-soft:#eff4ff;
+--amber:#a8620a;--amber-soft:#fdf5e9;--gray:#5b6b82;--gray-soft:#f2f4f8;--red:#b42318;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1.72;
+font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",Helvetica,Arial,sans-serif;
+-webkit-font-smoothing:antialiased}
+.paper{max-width:1040px;margin:0 auto;padding:28px 20px 72px}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}
+
+/* ---------- 头部 ---------- */
+.hero{position:relative;overflow:hidden;background:linear-gradient(135deg,#0f1e33 0%,#1b3454 58%,#274d78 100%);
+color:#f4f8ff;border-radius:20px;padding:34px 36px 28px;box-shadow:0 18px 40px rgba(15,30,51,.26)}
+.hero .eyebrow{font-size:12.5px;letter-spacing:.22em;color:#9db8d8;text-transform:uppercase}
+.hero h1{margin:8px 0 6px;font-size:34px;line-height:1.2;letter-spacing:.5px}
+.hero h1 .date{color:#ffd97a}
+.hero .lede{margin:6px 0 0;color:#cfdcee;font-size:15px;max-width:56em}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:22px 0 6px}
+.kpi{background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.16);border-radius:14px;padding:13px 15px}
+.kpi b{display:block;font-size:27px;font-weight:700;line-height:1.15}
+.kpi span{font-size:12.5px;color:#c3d5ea}
+.hero .meta{margin:14px 0 0;color:#9db8d8;font-size:12.5px}
+
+/* ---------- 导航 ---------- */
+.toc{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 0}
+.toc a{background:var(--card);border:1px solid var(--line);color:var(--ink-soft);padding:6px 14px;
+border-radius:999px;font-size:13px;box-shadow:0 1px 2px rgba(16,24,40,.04);transition:.15s}
+.toc a:hover{border-color:#9fb2cc;color:var(--navy);text-decoration:none;transform:translateY(-1px)}
+
+/* ---------- 内容区块 ---------- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:24px 28px 20px;
+margin:18px 0;box-shadow:0 2px 12px rgba(16,24,40,.045)}
+.card>h2{margin:0 0 4px;font-size:21px;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
+.card>h2::before{content:"";width:6px;height:22px;border-radius:3px;background:var(--navy)}
+#bullish>h2::before{background:var(--green)}
+#concept>h2::before{background:var(--blue)}
+#pending>h2::before{background:var(--amber)}
+#noninv>h2::before,#others>h2::before,#deepdive>h2::before,#sources>h2::before{background:var(--gray)}
+.caption{color:var(--muted);font-size:13.5px;margin:6px 0 4px}
+.notice{background:var(--gold-soft);border:1px solid #ecd9a5;border-radius:12px;padding:12px 16px;
+color:#6d5716;font-size:14px;margin:12px 0}
+
+/* ---------- 事件 ---------- */
+.event{border:1px solid var(--line);border-radius:16px;padding:18px 20px 12px;margin:16px 0;
+background:linear-gradient(180deg,#fff 0%,#fbfcff 100%)}
+.event>header{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.event h3{margin:0;font-size:18px;line-height:1.45}
+.event .meta{margin:0;color:var(--muted);font-size:13px}
+.event .meta .org{color:var(--ink-soft);font-weight:600}
+.event .meta a{white-space:nowrap}
+
+.signal{padding:12px 14px;border-radius:12px;background:#f8fafd;border:1px solid #eef2f8;margin:12px 0}
+.signal h4{margin:0 0 8px;font-size:15.5px;color:var(--navy-2);line-height:1.55}
+.facts{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--ink-soft);margin:0 0 8px}
+.fct em{font-style:normal;color:var(--muted);margin-right:5px}
+.fct b{font-weight:600}
+blockquote{margin:8px 0 0;border-left:3px solid var(--gold);background:#fffdf6;color:#4b3f19;
+padding:10px 14px;border-radius:0 10px 10px 0;font-size:14px}
+
+/* ---------- 表格 ---------- */
+.tablewrap{overflow-x:auto;margin:12px 0 6px}
+table{border-collapse:collapse;width:100%;font-size:13.8px;background:#fff;border-radius:12px;overflow:hidden}
+thead th{background:#eef2f9;color:#33415c;font-weight:600;font-size:13px;white-space:nowrap;
+padding:9px 12px;text-align:left;border-bottom:1px solid var(--line)}
+tbody td{padding:9px 12px;border-bottom:1px solid #eef1f7;vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:nth-child(even){background:#fafbfe}
+tbody tr:hover{background:#f2f7ff}
+td.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink-soft)}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+th.num{text-align:right}
+.score{display:inline-flex;align-items:center;gap:8px;justify-content:flex-end;min-width:92px}
+.score i{position:relative;display:block;width:46px;height:6px;border-radius:99px;background:#e8edf5;overflow:hidden}
+.score i::after{content:"";display:block;height:100%;width:var(--w,0%);border-radius:99px;
+background:linear-gradient(90deg,#79b7a3,#0f7a55)}
+.score b{font-weight:600;min-width:36px;text-align:right}
+.why{color:var(--ink-soft)}
+
+/* ---------- 深度研判 ---------- */
+.dive{border:1px solid var(--line);border-radius:16px;padding:16px 20px;margin:14px 0;background:#fcfdff}
+.dive h3{margin:0 0 10px;font-size:17px}
+.dive dl{margin:0;display:grid;grid-template-columns:96px 1fr;gap:6px 14px;font-size:14px}
+.dive dt{color:var(--muted)}
+.dive dd{margin:0;color:var(--ink-soft)}
+.tag{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12.5px;border:1px solid transparent;margin-left:6px}
+.tag.yes{background:var(--green-soft);color:var(--green);border-color:#c7e9da}
+.tag.no{background:var(--gray-soft);color:var(--gray);border-color:#e1e6ee}
+.tag.unknown{background:var(--amber-soft);color:var(--amber);border-color:#eedcc0}
+
+/* ---------- 收尾 ---------- */
+.disclaimer{background:#fff8f8;border:1px solid #f3d2d2;color:#8f2727;font-size:13.5px}
+.disclaimer h2{font-size:16px;margin:0 0 6px}
+footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:22px;line-height:1.9}
+@media (max-width:640px){
+.paper{padding:16px 12px 48px}.hero{padding:24px 20px;border-radius:16px}.hero h1{font-size:26px}
+.card{padding:18px 16px}.event{padding:14px 14px 8px}
+.dive dl{grid-template-columns:78px 1fr}
+}
+@media print{
+body{background:#fff}.paper{max-width:none;padding:0}.hero{box-shadow:none}
+.card,.event,.dive{box-shadow:none;break-inside:avoid}.toc{display:none}
+}
+"""
+
+
+def _signal_html(c: dict) -> str:
+    facts = "".join([
+        f"<span class='fct'><em>影响力度</em><b>{_esc(strength_label(c['strength']))}</b></span>",
+        f"<span class='fct'><em>影响周期</em><b>{_esc(horizon_label(c['horizon']))}</b></span>",
+        f"<span class='fct'><em>政策性质</em><b>{_esc(c['novelty'] or '—')}</b></span>",
+        f"<span class='fct'><em>涉及主题</em><b>{_esc(_theme_text(c))}</b></span>",
+        f"<span class='fct'><em>政策工具</em><b>{_esc(_instrument_text(c))}</b></span>",
+        f"<span class='fct'><em>研判可信度</em><b>{_esc(confidence_label(c['confidence']))}</b></span>",
+    ])
+    return (f"<div class='signal'><h4>{_esc(c['summary'])}</h4>"
+            f"<p class='facts'>{facts}</p>"
+            f"<blockquote>{_esc(c['quote'])}</blockquote></div>")
+
+
+def _score_cell(score) -> str:
+    try:
+        pct = max(0.0, min(100.0, float(score)))
+    except (TypeError, ValueError):
+        pct = 0.0
+    return (f"<span class='score'><i style='--w:{pct:.0f}%'></i>"
+            f"<b>{_esc(score)}</b></span>")
+
+
+def _picks_table_html(rows: list[dict]) -> str:
+    body = "".join(
+        f"<tr><td>{i}</td><td class='code'>{_esc(t['ticker_code'])}</td>"
+        f"<td><b>{_esc(t['ticker_name'])}</b></td><td>{_esc(t['sector_name'])}</td>"
+        f"<td class='num'>{t['market_cap']:.1f}</td>"
+        f"<td class='num'>{_score_cell(t['score'])}</td>"
+        f"<td class='num'>{_esc(t.get('relevance', t.get('mapping_confidence', 0)))}</td>"
+        f"<td class='why'>{_esc(t['why'])}</td></tr>"
+        for i, t in enumerate(rows, start=1)
+    )
+    return ("<div class='tablewrap'><table><thead><tr><th>#</th><th>代码</th><th>名称</th>"
+            "<th>所属板块</th><th class='num'>市值（亿元）</th><th class='num'>综合评分</th>"
+            "<th class='num'>主题相关度</th><th>受益理由</th></tr></thead>"
+            f"<tbody>{body}</tbody></table></div>")
+
+
+def _event_html(ev, min_strength: int, caps: PickCaps) -> str:
     """单个事件的 HTML 段：与 md 的 _render_event 同一套分区与筛选口径。"""
-    section = _event_section(ev, verdicts_by_event, totals_by_event)
     qualifying = _qualifying(ev, min_strength)
-    table_rows = merge_tickers(_restrict_tickers(qualifying, _event_allowed(caps, ev)),
-                              caps.per_event)
-    trows = "".join(
-        f"<tr><td>{i}</td><td>{_esc(t['ticker_code'])}</td><td>{_esc(t['ticker_name'])}</td>"
-        f"<td>{_esc(t['sector_name'])}</td><td>{t['market_cap']:.1f}</td><td>{t['score']}</td>"
-        f"<td>{t.get('relevance', t.get('mapping_confidence', 0))}</td>"
-        f"<td>{_esc(t['why'])}</td>"
-        f"<td><a href='{_esc(ev.source_url)}' target='_blank'>原文</a></td></tr>"
-        for i, t in enumerate(table_rows, start=1)
-    )
-    table_html = (
-        "<div class='tablewrap'><table><thead><tr><th>#</th><th>代码</th><th>名称</th><th>板块</th>"
-        "<th>市值(亿)</th>"
-        "<th>score</th><th>相关性</th><th>理由</th><th>溯源</th></tr></thead>"
-        f"<tbody>{trows}</tbody></table></div>"
-        if table_rows else
-        f"<p class='meta'>本事件个股未进入全局选股 Top-{caps.global_cap}，不列个股表。</p>"
-    )
-    sigs = "".join(
-        f"<h4><code>{_esc(c['signal_id'])}</code> {_esc(c['summary'])}</h4>"
-        f"<p class='meta'>strength {c['strength']} · 置信度 {c['confidence']} · "
-        f"引用校验 {'通过' if c['quote_verified'] else '未通过'} · {_esc(c['org'])} · "
-        f"{_esc(c['published_at'])}</p>"
-        f"<blockquote>{_esc(c['quote'])}</blockquote>"
-        for c in qualifying
-    )
-    return (
-        f"<section><h3>{_esc(ev.title)}</h3>"
-        f"<p class='meta'>事件ID <code>{_esc(ev.event_id)}</code> · 分区：{_esc(section)} · "
-        f"{_esc(ev.org)} · {_esc(ev.meeting_type)} · "
-        f"{_esc(ev.published_at)} · 合并 {len(ev.doc_ids)} 篇文档 · 信号 {len(ev.conclusions)} 条</p>"
-        f"{sigs}"
-        f"{table_html}</section>"
-    )
+    rows = _event_picks(ev, qualifying, caps)
+    meta = " · ".join(_esc(m) if i else f"<span class='org'>{_esc(m)}</span>"
+                      for i, m in enumerate(_source_meta(ev)))
+    sigs = "".join(_signal_html(c) for c in qualifying)
+    table = (_picks_table_html(rows) if rows
+             else f"<p class='caption'>{_esc(_empty_event_notice(caps))}</p>")
+    return (f"<article class='event'><header>"
+            f"<h3>{_esc(ev.title)}</h3>"
+            f"<p class='meta'>{meta} · "
+            f"<a href='{_esc(ev.source_url)}' target='_blank' rel='noopener'>查看政策原文 ↗</a></p>"
+            f"</header>{sigs}{table}</article>")
 
 
 def _non_investable_html(conclusions: list[dict]) -> str:
-    """非投资信号区（HTML）：与 md 同名分区同一批信号、同一判定依据。"""
+    """泛政策表述区（HTML）：与 md 同名分区同一批信号。"""
     rows = [c for c in conclusions if not c.get("investable", True)]
     if not rows:
         return ""
     cells = "".join(
-        f"<tr><td><code>{_esc(c['signal_id'])}</code></td><td>{_esc(c['summary'][:40])}</td>"
-        f"<td>{_esc(c.get('investable_reason', '') or '—')}</td>"
-        f"<td><a href='{_esc(c['source_url'])}' target='_blank'>{_esc(c['org'])}</a></td></tr>"
+        f"<tr><td>{_esc(_brief(c['summary']))}</td>"
+        f"<td><a href='{_esc(c['source_url'])}' target='_blank' rel='noopener'>"
+        f"{_esc(c['org'])}</a></td></tr>"
         for c in rows
     )
-    return (
-        "<h2>非投资信号（泛经济样板表述，不映射板块、不展开个股）</h2>"
-        "<div class='tablewrap'><table><thead><tr><th>信号ID</th><th>摘要</th>"
-        "<th>判定依据</th><th>原文</th></tr></thead>"
-        f"<tbody>{cells}</tbody></table></div>"
+    return (f"<section class='card' id='noninv'><h2>{SECTION_LABELS[SECTION_NON_INVESTABLE]}</h2>"
+            f"<p class='caption'>{SECTION_NOTES[SECTION_NON_INVESTABLE]}</p>"
+            "<div class='tablewrap'><table><thead><tr><th>政策表述</th><th>原文</th></tr></thead>"
+            f"<tbody>{cells}</tbody></table></div></section>")
+
+
+def _other_signals_html(conclusions: list[dict], rendered_ids: set[str]) -> str:
+    rows = [c for c in conclusions
+            if c["signal_id"] not in rendered_ids and c.get("investable", True)]
+    if not rows:
+        return ""
+    cells = "".join(
+        f"<tr><td>{_esc(c['direction'])}</td><td class='num'>{_esc(strength_label(c['strength']))}</td>"
+        f"<td>{_esc(_brief(c['summary']))}</td>"
+        f"<td><a href='{_esc(c['source_url'])}' target='_blank' rel='noopener'>"
+        f"{_esc(c['org'])}</a></td></tr>"
+        for c in rows
     )
+    return ("<section class='card' id='others'><h2>其他政策信号（中性、偏空或影响有限）</h2>"
+            "<p class='caption'>这些信号本期没有形成明确的受益个股，仅作记录。</p>"
+            "<div class='tablewrap'><table><thead><tr><th>方向</th><th class='num'>影响力度</th>"
+            "<th>政策信号</th><th>原文</th></tr></thead>"
+            f"<tbody>{cells}</tbody></table></div></section>")
 
 
-def _partition(result, events, min_strength: int):
-    """分区共用：md / json / html 三端都从这里拿同一批结果。"""
-    deepdives = list(getattr(result, "deepdives", None) or [])
-    verdicts = _verdicts_by_event(deepdives)
-    totals = _totals_by_event(deepdives)
-    sections = {ev.event_id: _event_section(ev, verdicts, totals) for ev in events}
-    main_events = [ev for ev in events
-                   if sections[ev.event_id] in MAIN_SECTIONS and _qualifying(ev, min_strength)]
-    concept_events = [ev for ev in events
-                      if sections[ev.event_id] == SECTION_CONCEPT_ONLY and _qualifying(ev, min_strength)]
-    pending_events = [ev for ev in events
-                      if sections[ev.event_id] == SECTION_CONCEPT_PENDING and _qualifying(ev, min_strength)]
-    return verdicts, totals, sections, main_events, concept_events, pending_events
+def _deepdive_html(result: RunResult) -> str:
+    dives = list(getattr(result, "deepdives", None) or [])
+    if not dives:
+        return ""
+    tag_class = {"是": "yes", "否": "no"}
+    parts = ["<section class='card' id='deepdive'><h2>个股深度研判</h2>"
+             "<p class='caption'>针对本期入选个股，逐只说明政策怎么传导到公司、"
+             "公司处在什么位置，以及需要留意的风险。</p>"]
+    for d in dives:
+        rows = []
+        if d.policy_summary:
+            rows.append(("主题关联", _esc(d.policy_summary)))
+        if d.transmission:
+            rows.append(("传导路径", _esc(d.transmission)))
+        if d.competition:
+            rows.append(("竞争地位", _esc(d.competition)))
+        if d.impact:
+            rows.append(("影响判断", _esc(d.impact)))
+        if getattr(d, "substantive", ""):
+            label = substantive_label(d.substantive)
+            cls = tag_class.get(str(d.substantive).strip(), "unknown")
+            rows.append(("实质影响", f"<span class='tag {cls}'>{_esc(label)}</span>"))
+        if d.risks:
+            rows.append(("风险提示", _esc("；".join(d.risks))))
+        if d.sources:
+            links = "；".join(f"{_esc(x['label'])}（<code>{_esc(x['ref'])}</code>）"
+                             for x in d.sources)
+            rows.append(("溯源", links))
+        body = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+        parts.append(f"<div class='dive'><h3>{_esc(d.ticker_name)}"
+                     f"（{_esc(d.ticker_code)}）· {_esc(d.policy_title)}</h3>"
+                     f"<dl>{body}</dl></div>")
+    parts.append("</section>")
+    return "".join(parts)
+
+
+def _sources_html(stats: dict) -> str:
+    rows = _source_rows(stats)
+    if not rows:
+        return ""
+    cells = "".join(
+        f"<tr><td>{_esc(org)}</td><td class='num'>"
+        f"{(f'{docs} 篇' if docs else '无更新')}</td></tr>"
+        for org, docs in rows)
+    failed = int(stats.get("sources_failed") or 0)
+    note = (f"<p class='caption'>本期有 {failed} 个渠道访问失败，可能影响覆盖完整性。</p>"
+            if failed else "")
+    return ("<section class='card' id='sources'><h2>信息来源</h2>"
+            "<p class='caption'>本期检查的官方渠道，以及各自收录到的政策/会议稿件数量。</p>"
+            "<div class='tablewrap'><table><thead><tr><th>机构</th>"
+            f"<th class='num'>本期收录</th></tr></thead><tbody>{cells}</tbody></table></div>"
+            f"{note}</section>")
+
 
 def _sections_html(result, events, min_strength: int, caps: PickCaps,
                    parts_nav: dict | None = None) -> str:
     """HTML 的分区，与 md / json 使用同一套 _event_section 判定。"""
-    (verdicts, totals, sections, main_events,
+    (_, _, _, main_events,
      concept_events, pending_events) = _partition(result, events, min_strength)
     if parts_nav is not None:
         parts_nav.update({
@@ -638,175 +849,127 @@ def _sections_html(result, events, min_strength: int, caps: PickCaps,
                                   for c in result.conclusions),
         })
 
-    parts = ["<a id='sec-bullish'></a><h2>受益个股</h2>",
-             f"<p class='meta'>{_esc(_pick_caption(caps))}</p>"]
+    parts = ["<section class='card' id='bullish'>",
+             f"<h2>{SECTION_LABELS[SECTION_BULLISH]}</h2>",
+             f"<p class='caption'>{_esc(_pick_caption(caps))}</p>",
+             f"<p class='caption'>{_esc(_metric_caption())}</p>"]
     if main_events:
-        parts.extend(_event_html(ev, verdicts, totals, min_strength, caps)
-                     for ev in main_events)
+        parts.extend(_event_html(ev, min_strength, caps) for ev in main_events)
     else:
-        parts.append("<p><strong>今日无实质投资信号</strong>：没有深读明判「有实质影响」"
-                     "的政策事件。下面是仅概念关联、待判定与非投资信号留痕。</p>")
+        parts.append("<p class='notice'><strong>本期暂无明确受益个股</strong>：没有找到"
+                     "「政策明确指向、且能落到具体公司」的事件。下面按主题关联与政策留痕"
+                     "列出，供参考。</p>")
+    parts.append("</section>")
     if concept_events:
-        parts.append("<a id='sec-concept'></a><h2>仅概念关联（深读判定无实质传导，不授予受益头衔）</h2>")
-        parts.extend(_event_html(ev, verdicts, totals, min_strength, caps)
-                     for ev in concept_events)
+        parts.append("<section class='card' id='concept'>")
+        parts.append(f"<h2>{SECTION_LABELS[SECTION_CONCEPT_ONLY]}</h2>")
+        parts.append(f"<p class='caption'>{SECTION_NOTES[SECTION_CONCEPT_ONLY]}</p>")
+        parts.extend(_event_html(ev, min_strength, caps) for ev in concept_events)
+        parts.append("</section>")
     if pending_events:
-        parts.append("<a id='sec-pending'></a><h2>待判定：无实质传导证据（未做深读判定，留痕可见但不进受益区）</h2>")
-        parts.extend(_event_html(ev, verdicts, totals, min_strength, caps)
-                     for ev in pending_events)
-    non_inv_html = _non_investable_html(result.conclusions)
-    if non_inv_html:
-        non_inv_html = "<a id='sec-noninv'></a>" + non_inv_html
-    parts.append(non_inv_html)
+        parts.append("<section class='card' id='pending'>")
+        parts.append(f"<h2>{SECTION_LABELS[SECTION_CONCEPT_PENDING]}</h2>")
+        parts.append(f"<p class='caption'>{SECTION_NOTES[SECTION_CONCEPT_PENDING]}</p>")
+        parts.extend(_event_html(ev, min_strength, caps) for ev in pending_events)
+        parts.append("</section>")
+
+    rendered_ids = {c["signal_id"]
+                    for ev in main_events + concept_events + pending_events
+                    for c in _qualifying(ev, min_strength)}
+    parts.append(_other_signals_html(result.conclusions, rendered_ids))
+    parts.append(_non_investable_html(result.conclusions))
     return "".join(parts)
 
 
-_PAGE_CSS = """
-:root{--bg:#f3f5f9;--paper:#fff;--ink:#182230;--muted:#667085;--line:#e4e8ef;
---navy:#132439;--gold:#b98a13;--green:#0e7a52;--blue:#1d4ed8;--amber:#b45309;
---gray:#667085;--red:#b42318}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font-size:15px;line-height:1.7;
-font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Helvetica,Arial,"Microsoft YaHei",sans-serif}
-.paper{max-width:1120px;margin:0 auto;padding:26px 20px 64px}
-.hero{background:linear-gradient(135deg,#101c30 0%,#1c3352 55%,#274b74 100%);color:#f5f8ff;
-border-radius:18px;padding:30px 34px;box-shadow:0 14px 34px rgba(16,28,48,.28)}
-.hero h1{margin:0 0 6px;font-size:27px;letter-spacing:.5px}
-.hero .sub{color:#bfd2ea;font-size:14px}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0 4px}
-.kpi{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16);border-radius:12px;padding:12px 14px}
-.kpi .v{font-size:26px;font-weight:700;line-height:1.2}
-.kpi .k{font-size:12.5px;color:#c8d8ef;margin-top:2px}
-.toc{margin:16px 0 0;display:flex;flex-wrap:wrap;gap:8px}
-.toc a{background:#fff;border:1px solid var(--line);color:#344054;text-decoration:none;
-padding:5px 13px;border-radius:999px;font-size:13px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
-.toc a:hover{border-color:#98a6bd;color:var(--navy)}
-.card{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:22px 26px;
-margin:18px 0;box-shadow:0 2px 10px rgba(16,24,40,.05)}
-h1{font-size:26px} h2{font-size:20px;margin:6px 0 12px;padding-left:12px;border-left:5px solid var(--navy)}
-a#sec-bullish + h2{border-color:var(--green)}
-a#sec-concept + h2{border-color:var(--blue)}
-a#sec-pending + h2{border-color:var(--amber)}
-a#sec-noninv + h2,a#sec-compliance + h2{border-color:var(--gray)}
-h3{font-size:17.5px;margin:4px 0 4px} h4{font-size:15px;margin:14px 0 2px;color:#243b53}
-.meta{color:var(--muted);font-size:13px;margin-top:0}
-section{border:1px solid var(--line);border-radius:14px;padding:16px 18px 14px;margin:14px 0;
-background:linear-gradient(180deg,#fff 0%,#fcfdff 100%)}
-section h3{margin-top:0}
-blockquote{border-left:4px solid var(--gold);margin:8px 0;padding:9px 14px;background:#fbf7ec;color:#4a3d17;border-radius:0 10px 10px 0;font-size:14.5px}
-.tablewrap{overflow-x:auto}
-table{border-collapse:collapse;width:100%;margin:10px 0 8px;font-size:14px;background:#fff}
-th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
-th{background:#f0f3f8;color:#344054;font-weight:600;white-space:nowrap;position:sticky;top:0}
-tbody tr:nth-child(even){background:#f8fafc}
-tbody tr:hover{background:#eef4fd}
-td code{font-size:12.5px}
-.disc{background:#fff5f5;border:1px solid #f2c9c9;border-radius:12px;padding:12px 16px;color:#8f2727;font-size:13.5px}
-.caveat{background:#fdf9ec;border:1px solid #ead9a6;border-radius:12px;padding:11px 15px;color:#6d5716;font-size:13.5px;margin:8px 0}
-.notice{background:#eef6ff;border:1px solid #cfe0f7;border-radius:12px;padding:14px 18px;color:#1f4d8f}
-.small{font-size:12.5px;color:var(--muted)}
-.pill{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;border:1px solid transparent}
-.pill.on{background:#e7f6ef;color:#0e7a52;border-color:#bfe8d7}
-.pill.off{background:#f2f4f7;color:#667085;border-color:#e4e7ec}
-.statline{display:flex;flex-wrap:wrap;gap:8px 18px;background:#fff;border:1px solid var(--line);
-border-radius:12px;padding:11px 16px;font-size:13.5px;color:#475467;margin:14px 0}
-.statline b{color:var(--navy)}
-footer{margin-top:26px}
-@media print{body{background:#fff}.card,section{box-shadow:none}.toc{display:none}}
-"""
 def render_html(result: RunResult) -> str:
     s = result.stats
     min_strength = s.get("min_strength_for_report", 3)
     events = _ensure_events(result)
     caps = pick_caps(s, events)
-    non_investable = [c for c in result.conclusions if not c.get("investable", True)]
-    (verdicts, totals, sections, main_events,
+    displayed = sum(len(_event_picks(ev, _qualifying(ev, min_strength), caps)) for ev in events)
+    (_, _, _, main_events,
      concept_events, pending_events) = _partition(result, events, min_strength)
     nav_flags = {"bullish": bool(main_events), "concept": bool(concept_events),
-                 "pending": bool(pending_events), "non_investable": bool(non_investable)}
-
-    compliance = ""
-    rows_detail = s.get("sources_detail") or []
-    if rows_detail:
-        cells = "".join(
-            f"<tr><td><code>{_esc(r['id'])}</code></td><td>{_esc(r['org'])}</td>"
-            f"<td><span class='pill {'on' if r['enabled'] else 'off'}'>"
-            f"{'启用' if r['enabled'] else '停用'}</span></td>"
-            f"<td>{_esc(r['robots'])}</td>"
-            f"<td class='small'>{_esc(r['robots_reason'])}</td><td>{r['docs']}</td>"
-            f"<td>{_esc(r.get('outcome', '—'))}</td></tr>"
-            for r in rows_detail)
-        compliance = (
-            "<a id='sec-compliance'></a><h2>信息源与合规</h2><div class='tablewrap'>"
-            "<table class='ledger'><thead><tr><th>源ID</th><th>机构</th><th>状态</th>"
-            "<th>robots 判定</th><th>判定依据</th><th>本轮文档</th><th>本轮去向</th>"
-            f"</tr></thead><tbody>{cells}</tbody></table></div>")
+                 "pending": bool(pending_events),
+                 "non_investable": any(not c.get("investable", True)
+                                       for c in result.conclusions)}
 
     if not result.conclusions:
-        body = f"<p class='notice'>{_esc(EMPTY_DAY_NOTICE)}</p>"
-        if s.get("docs", 0) == 0:
-            body = (f"<p class='notice'><strong>{_esc(EMPTY_DAY_NOTICE)}</strong>（窗口 "
-                    f"{_esc(result.window_start)} ~ {_esc(result.window_end)}）</p>")
+        body = (f"<section class='card' id='bullish'><h2>{EMPTY_DAY_NOTICE}</h2>"
+                f"<p class='notice'>统计区间 {_esc(result.window_start)} ~ "
+                f"{_esc(result.window_end)} 内没有新的政策发布或会议通稿，本期无新增内容。</p>"
+                "</section>")
     else:
         body = _sections_html(result, events, min_strength, caps, parts_nav=nav_flags)
 
-    nav_items = []
-    if nav_flags["bullish"]:
-        nav_items.append(("sec-bullish", "受益个股"))
-    if nav_flags["concept"]:
-        nav_items.append(("sec-concept", "仅概念关联"))
-    if nav_flags["pending"]:
-        nav_items.append(("sec-pending", "待判定"))
-    if nav_flags["non_investable"]:
-        nav_items.append(("sec-noninv", "非投资信号"))
-    if compliance:
-        nav_items.append(("sec-compliance", "信息源与合规"))
-    toc = "".join(f"<a href='#{fid}'>{label}</a>" for fid, label in nav_items)
-    toc = f"<nav class='toc'>{toc}</nav>" if toc else ""
+    rendered_ids = {c["signal_id"]
+                    for ev in main_events + concept_events + pending_events
+                    for c in _qualifying(ev, min_strength)}
+    has_others = any(c["signal_id"] not in rendered_ids and c.get("investable", True)
+                     for c in result.conclusions)
+
+    orgs: list[str] = []
+    for ev in events:
+        if ev.org and ev.org not in orgs:
+            orgs.append(ev.org)
+    with_tickers = s.get("with_tickers", 0)
+    lede_bits = [f"跟踪到 <b>{s.get('events', len(events))}</b> 起政策事件",
+                 f"<b>{s.get('signals', len(result.conclusions))}</b> 条政策信号"]
+    if with_tickers:
+        lede_bits.append(f"其中 <b>{with_tickers}</b> 条落到具体行业与个股")
+    lede = "，".join(lede_bits) + "。"
 
     kpis = [
-        (s.get("docs", len(result.docs)), "窗口内文档（入库+复用）"),
-        (s.get("events", len(events)), "政策事件（聚类后）"),
-        (s.get("signals", len(result.conclusions)), "报告信号总数"),
-        (s.get("ticker_rows_event", s.get("ticker_rows", 0)), "个股（事件内去重）"),
-        (len(non_investable), "非投资信号"),
-        (s.get("pbc_related_docs", 0), "央行相关文档"),
+        (s.get("events", len(events)), "政策事件"),
+        (s.get("signals", len(result.conclusions)), "政策信号"),
+        (displayed, "列出个股"),
     ]
-    kpi_html = "".join(f"<div class='kpi'><div class='v'>{v}</div>"
-                       f"<div class='k'>{_esc(k)}</div></div>" for v, k in kpis)
-    stat_bits = [
-        f"窗口 <b>{_esc(result.window_start)} ~ {_esc(result.window_end)}</b>",
-        f"run_id <b>{_esc(result.run_id)}</b>",
-        f"有映射个股的信号 <b>{s.get('with_tickers', 0)}</b>",
-        f"全局入选 <b>{len(caps.allowed or set()) if caps.global_cap > 0 else s['ticker_rows']}</b>",
-        f"跨 run 复用 <b>{s.get('duplicates_skipped', 0)}</b> 篇",
-        f"窗口外剔除 <b>{s.get('out_of_window_docs', 0)}</b>",
-        f"抓取失败 <b>{s.get('fetch_failures', 0)}</b>",
-        f"LLM 抽取 <b>{'开启' if s.get('llm_enabled') else '关闭（规则）'}</b>",
-        f"深度研读 <b>{s.get('deepdive_count', 0)}</b> 条",
-    ]
-    statline = "<div class='statline'>" + "".join(f"<span>{b}</span>" for b in stat_bits) + "</div>"
+    if _source_count(s):
+        kpis.append((_source_count(s), "信息来源"))
+    kpi_html = "".join(f"<div class='kpi'><b>{v}</b><span>{_esc(k)}</span></div>" for v, k in kpis)
 
+    nav_items = []
+    if nav_flags["bullish"]:
+        nav_items.append(("bullish", SECTION_LABELS[SECTION_BULLISH]))
+    if nav_flags["concept"]:
+        nav_items.append(("concept", SECTION_LABELS[SECTION_CONCEPT_ONLY]))
+    if nav_flags["pending"]:
+        nav_items.append(("pending", SECTION_LABELS[SECTION_CONCEPT_PENDING]))
+    if nav_flags["non_investable"]:
+        nav_items.append(("noninv", SECTION_LABELS[SECTION_NON_INVESTABLE]))
+    if has_others:
+        nav_items.append(("others", "其他政策信号"))
+    if getattr(result, "deepdives", None):
+        nav_items.append(("deepdive", "个股深度研判"))
+    if [r for r in (s.get("sources_detail") or []) if r.get("enabled", True)]:
+        nav_items.append(("sources", "信息来源"))
+    toc = "".join(f"<a href='#{fid}'>{_esc(label)}</a>" for fid, label in nav_items)
+    toc = f"<nav class='toc'>{toc}</nav>" if toc else ""
+
+    window_note = f"统计区间 {result.window_start} ~ {result.window_end}"
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PolicyPulse 日报 {_esc(result.window_end)}</title>
+<title>PolicyPulse 日报 · {_esc(result.window_end)}</title>
 <style>{_PAGE_CSS}</style></head><body><div class="paper">
 <header class="hero">
-<h1>PolicyPulse 日报 <span style="color:#ffd97a">{_esc(result.window_end)}</span></h1>
-<p class="sub">窗口 {_esc(result.window_start)} ~ {_esc(result.window_end)} · 数据仅供研究参考</p>
+<div class="eyebrow">PolicyPulse · 政策信号日报</div>
+<h1><span class="date">{_esc(result.window_end)}</span></h1>
+<p class="lede">{lede}</p>
 <div class="kpis">{kpi_html}</div>
+<p class="meta">{_esc(window_note)} · 数据仅供研究参考，不构成投资建议</p>
 </header>
 {toc}
-<main class="card">
-<p class="disc">{_esc(DISCLAIMER)}</p>
-<p class="caveat">口径说明：{_esc(MAPPING_CAVEAT)}</p>
-<p class="caveat">{_esc(INVESTABLE_CAVEAT)}</p>
-<p class="caveat">{_esc(GATE_CAVEAT)}</p>
-{statline}
+<main>
 {body}
-{compliance}
+{_deepdive_html(result)}
+{_sources_html(s)}
+<section class="card disclaimer" id="disclaimer">
+<h2>免责声明</h2>
+<p>{_esc(DISCLAIMER)}</p>
+</section>
 </main>
-<footer><p class="disc">{_esc(DISCLAIMER)}</p></footer>
+<footer>PolicyPulse · 公开政策信息自动汇总与主题映射<br>
+个股为政策主题映射结果，不代表公司基本面判断，也不构成任何收益承诺</footer>
 </div></body></html>"""
 
 
