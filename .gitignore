@@ -6,9 +6,8 @@ data/snapshots/
 data/cache/
 *.db
 
-# 日报：Markdown / HTML 入库作为交付物与证据；
-# JSON 是本机产物（快照字段保留绝对路径），不入库
-reports/*.json
+# 日报产物：Markdown / HTML / JSON 均为本机交付物，不入库
+reports/
 
 # 人工 inbound 目录：只保留目录骨架（.gitkeep），用户放进去的原稿不入库
 inbound/*/*
