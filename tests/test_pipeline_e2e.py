@@ -277,3 +277,78 @@ def test_text_fallback_date_out_of_window_is_still_dropped(workspace):
     assert diag["no_update"] == ["gov_zhengce"]
     assert any("窗口外剔除" in w and "2026-10-14" in w for w in fetcher.warnings), \
         "文本分支取到的窗口外日期同样要留下可回溯的告警明细"
+
+
+# ---------- 商务部：列表页日期 + 候选按日期排序（WAN-26）----------
+
+MOFCOM_LIST = (Path(__file__).parent / "fixtures" / "mofcom_xwfb_list.html").read_text(encoding="utf-8")
+MOFCOM_URL = "http://www.mofcom.gov.cn/xwfb/index.html"
+
+
+def _mofcom_spec():
+    from policypulse.config import SourceSpec
+
+    return SourceSpec(id="mofcom_xwfb", name="新闻发布", org="商务部", tier="部委",
+                      adapter="html_list", url=MOFCOM_URL, column="新闻发布",
+                      meeting_type_hint="会议", rate_limit_seconds=0.0,
+                      extra={"link_pattern": r"/art/\d{4}/art_", "max_items": 60,
+                             "min_title_length": 10, "reject_pattern": r"/zfxxgk/"})
+
+
+def _mofcom_detail(title: str, published: str) -> str:
+    """详情页：日期只在 meta PubDate 里（与商务部真实模板一致）。"""
+    body = (
+        f"{title}\n"
+        "有记者问：近日有关部门发布了对华投资限制措施，请问商务部对此有何评论？\n"
+        "答：中方注意到有关情况。商务部将会同有关部门密切关注，依法依规处理，"
+        "坚决维护中国企业合法权益，同时继续推进高水平对外开放，稳住外贸外资基本盘，"
+        "支持跨境电商、海外仓等新业态发展，推动外贸提质增效。\n"
+        "下一步，商务部将抓好各项政策落实，加强部门协同和央地联动，"
+        "持续优化营商环境，为外资企业提供更多便利，推动外贸稳规模、优结构，"
+        "并把政策红利尽快传导到经营主体，切实增强企业获得感。\n"
+    )
+    return (f'<html><head><meta name="PubDate" content="{published} 10:00">'
+            f"<title>{title}</title></head>"
+            f'<body><div class="content">{body}</div></body></html>')
+
+
+def _mofcom_pages(published_days) -> dict[str, str]:
+    """列表页 + 指定日期那几条的详情页；窗口外稿件的详情页故意不给。"""
+    pages = {MOFCOM_URL: MOFCOM_LIST}
+    from policypulse.sources.html_list import HtmlListAdapter
+
+    items = HtmlListAdapter().discover(_mofcom_spec(), _FrozenFetcher(pages))
+    for item in items:
+        if item.published_at in published_days:
+            pages[item.url] = _mofcom_detail(item.title, item.published_at)
+    return pages
+
+
+def test_candidates_are_selected_by_date_not_by_page_order(tmp_path):
+    """商务部首页顺序是栏目顺序：领导人活动在最前，产业栏目在后。
+
+    按页面顺序取前 N 条，产业稿件（日常新闻发布/发言人谈话/司局负责人发布）
+    会永远被截掉；这里断言候选先按日期过滤窗口、再按日期倒序。
+    """
+    fetcher = _FrozenFetcher(_mofcom_pages({"2026-10-24", "2026-10-23"}))
+    docs, failed, _ = fetch_documents(fetcher, [_mofcom_spec()], Settings(max_docs_per_source=1),
+                                     "2026-10-24", "2026-10-24", tmp_path, "run-mofcom", None)
+    assert failed == []
+    assert [d.published_at for d in docs] == ["2026-10-24"]
+    # 页面第 1 条是转载的「李强主持召开国务院常务会议」（10-23，窗口外）；
+    # 取到的必须是窗口内最新那条商务部自己的稿件
+    assert "商务部新闻发言人" in docs[0].title
+
+
+def test_all_in_window_mofcom_docs_are_kept(tmp_path):
+    """窗口内有 6 条时全部入库，且不再有「详情页日期剔除」的浪费。"""
+    diag: dict = {}
+    fetcher = _FrozenFetcher(_mofcom_pages({"2026-10-24", "2026-10-23"}))
+    docs, failed, _ = fetch_documents(fetcher, [_mofcom_spec()], Settings(max_docs_per_source=12),
+                                     "2026-10-23", "2026-10-24", tmp_path, "run-mofcom2", None, diag)
+    assert failed == []
+    assert len(docs) == 6
+    assert all(d.published_at in ("2026-10-23", "2026-10-24") for d in docs)
+    assert diag["out_of_window_docs"] == 0
+    # 只请求了窗口内的详情页：页面顺序前 3 条（10-23/10-22/10-22）之外没有再白抓旧稿
+    assert all(u in fetcher.pages for u in fetcher.requests)

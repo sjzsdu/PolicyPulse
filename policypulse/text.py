@@ -155,22 +155,53 @@ def simplify_hant(text: str) -> str:
 
 _DATE_PAT = r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})"
 
+# 稿件自家的发布时间元数据：比在整页里撞第一个日期可靠（页面上先出现的可能是
+# 栏目模板里的其它日期）。商务部等 CMS 站点都会写 meta PubDate。
+_PUBDATE_META_KEYS = ("pubdate", "publishdate", "publish_date", "articledate",
+                      "article:published_time", "og:release_date", "releasetime")
+
+
+def _normalize_date(pattern: str, hay: str) -> str:
+    m = re.search(pattern, hay)
+    if not m:
+        return ""
+    y, mo, d = (int(x) for x in m.groups())
+    if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    return ""
+
+
+def _meta_publish_time(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:  # noqa: BLE001 - 解析不了就退回正则路径
+        return ""
+    for meta in soup.find_all("meta"):
+        key = (meta.get("name") or meta.get("property") or "").strip().lower()
+        if key and key in _PUBDATE_META_KEYS:
+            got = _normalize_date(_DATE_PAT, meta.get("content") or "")
+            if got:
+                return got
+    return ""
+
 
 def extract_publish_time(html: str, text: str = "") -> str:
     """从页面里找发布时间，找不到返回空串（调用方用 fetched_at 兜底）。
+
+    顺序：meta 发布时间 → 页面 HTML 的第一个日期 → 正文的第一个日期。
 
     html / text 两条路径必须返回同一种零填充 `YYYY-MM-DD`：`_in_window` 是裸字符串
     比较，`2026年10月19`、`2026/10/19` 的分隔符码位大于 `-`，不归一会把窗口内稿件
     判成窗口外（误杀还会被计入 out_of_window_docs，与真剔除混在一起）。
     越界日期同样不返回原始串，交给调用方按「无日期」处理。
     """
+    got = _meta_publish_time(html)
+    if got:
+        return got
     for hay in (html[:200000], text or ""):
-        m = re.search(_DATE_PAT, hay)
-        if not m:
-            continue
-        y, mo, d = (int(x) for x in m.groups())
-        if 2000 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31:
-            return f"{y:04d}-{mo:02d}-{d:02d}"
+        got = _normalize_date(_DATE_PAT, hay)
+        if got:
+            return got
     return ""
 
 

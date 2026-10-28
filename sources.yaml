@@ -69,8 +69,14 @@ sources:
     meeting_type_hint: 会议
     rate_limit_seconds: 2.0
     link_pattern: '/art/\d{4}/art_'
-    max_items: 30
+    # 这个入口是「新闻发布」聚合页：领导人活动 / 部领导活动 / 日常新闻发布 /
+    # 新闻发言人谈话 / 司局负责人发布 五个栏目各挂最前 6 条，共 30 条左右。
+    # 页面顺序 = 栏目顺序，不是时间顺序，所以 max_items 必须覆盖全页，
+    # 否则产业类栏目会被「取前 N 条」整段截掉（真正的断点）。
+    max_items: 60
     min_title_length: 10
+    # 站内年报/机构介绍这类非新闻页，不属于政策信号
+    reject_pattern: '/zfxxgk/'
     enabled: true
 
   # ---------- 央行（pbc.gov.cn robots 全站禁止）----------
